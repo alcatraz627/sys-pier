@@ -2279,7 +2279,11 @@ function renderPage(processes) {
     <div class="modal modal-wide">
       <div class="modal-header">
         <h2>⚙ Dashboard Config</h2>
-        <button class="modal-close" onclick="closeModal('config-modal')">✕</button>
+        <div style="display:flex;gap:6px;align-items:center">
+          <button class="btn btn-sm" onclick="exportConfig()" title="Download config as JSON">↓ Export</button>
+          <button class="btn btn-sm" onclick="importConfig()" title="Upload config from JSON file">↑ Import</button>
+          <button class="modal-close" onclick="closeModal('config-modal')">✕</button>
+        </div>
       </div>
       <div class="config-tabs">
         <button class="config-tab active" data-tab="groups" onclick="switchConfigTab('groups')">Groups</button>
@@ -3546,6 +3550,47 @@ function renderPage(processes) {
       await fetch('/api/merges/' + encodeURIComponent(key), { method: 'DELETE' });
       toast('Unmerged ' + key, 'ok');
       refresh();
+    }
+
+    // ── Config export/import ────────────────────────────────────────────
+    function exportConfig() {
+      var blob = new Blob([JSON.stringify(DASH_CONFIG, null, 2)], { type: 'application/json' });
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'pm2-manage-config.json';
+      a.click();
+      URL.revokeObjectURL(a.href);
+      toast('Config exported', 'ok');
+    }
+
+    function importConfig() {
+      var input = document.createElement('input');
+      input.type = 'file';
+      input.accept = '.json';
+      input.onchange = async function() {
+        var file = input.files[0];
+        if (!file) return;
+        var t = toastAsync('Importing config');
+        try {
+          var text = await file.text();
+          var cfg = JSON.parse(text);
+          if (!cfg.groups && !cfg.entries && !cfg.staticUrls) {
+            t.error('Invalid config: missing groups/entries/staticUrls');
+            return;
+          }
+          var res = await fetch('/api/config', {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: text,
+          });
+          if (!res.ok) { t.error('Server rejected config'); return; }
+          var fresh = await fetch('/api/config');
+          DASH_CONFIG = await fresh.json();
+          t.done('Config imported (' + Object.keys(cfg.groups || {}).length + ' groups, ' + Object.keys(cfg.entries || {}).length + ' entries)');
+          renderConfigTab(currentConfigTab);
+          refresh();
+        } catch(e) { t.error('Import failed: ' + (e.message || 'invalid JSON')); }
+      };
+      input.click();
     }
 
     // ── Config modal ──────────────────────────────────────────────────────
