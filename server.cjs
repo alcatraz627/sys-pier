@@ -1120,11 +1120,11 @@ function renderPage(processes) {
 
     .proc-count {
       font-size: 0.7rem;
-      color: var(--text-muted);
-      padding: 2px 8px;
+      color: var(--text-secondary);
+      padding: 3px 9px;
       background: var(--bg-tertiary);
       border: 1px solid var(--border);
-      border-radius: var(--radius-sm);
+      border-radius: 100px;
       line-height: 1.3;
       white-space: nowrap;
     }
@@ -1133,7 +1133,7 @@ function renderPage(processes) {
       display: flex;
       align-items: center;
       gap: 0.4rem;
-      flex-wrap: wrap;
+      flex-wrap: nowrap;
       min-width: 0;
       margin-left: auto;
     }
@@ -1142,11 +1142,11 @@ function renderPage(processes) {
     .nav-group {
       display: inline-flex;
       align-items: center;
-      gap: 2px;
-      background: var(--bg-tertiary);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-sm);
-      padding: 2px;
+      gap: 3px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 6px;
+      padding: 2px 3px;
     }
     .nav-group .hdr-btn {
       border-color: transparent;
@@ -1191,6 +1191,7 @@ function renderPage(processes) {
       background: var(--accent-bg);
       color: var(--accent);
       font-weight: 600;
+      text-shadow: 0 0 8px rgba(99, 102, 241, 0.3);
     }
 
     .live-indicator {
@@ -1831,7 +1832,7 @@ function renderPage(processes) {
       position: relative;
       display: flex;
       align-items: center;
-      flex-shrink: 1;
+      flex: 0 1 auto;
     }
     .search-icon {
       position: absolute;
@@ -1849,9 +1850,9 @@ function renderPage(processes) {
       border-radius: var(--radius-sm);
       color: var(--text-primary);
       padding: 5px 10px 5px 24px;
-      width: 150px;
+      width: 130px;
       transition: border-color 0.15s, width 0.25s ease, background 0.15s;
-      min-width: 80px;
+      min-width: 70px;
     }
     .search-input:focus { outline: none; border-color: var(--accent); width: 220px; background: var(--bg-secondary); }
     .search-input::placeholder { color: var(--text-faint); }
@@ -2240,7 +2241,7 @@ function renderPage(processes) {
     }
     .scan-badge {
       display: inline-flex; align-items: center; justify-content: center;
-      background: var(--accent); color: var(--bg-primary); font-size: 0.6rem;
+      background: var(--text-faint); color: var(--bg-primary); font-size: 0.6rem;
       font-weight: 700; min-width: 16px; height: 16px; border-radius: 8px;
       padding: 0 4px; margin-left: 4px; line-height: 1;
     }
@@ -2676,7 +2677,7 @@ function renderPage(processes) {
         document.getElementById('proc-count').textContent =
           data.count + ' process' + (data.count !== 1 ? 'es' : '');
         document.getElementById('last-update').textContent =
-          new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+          new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
         if (data.stats)    updateStatsBar(data.stats);
         if (data.metrics) { lastMetrics = data.metrics; drawSparklines(data.metrics); }
@@ -3509,9 +3510,7 @@ function renderPage(processes) {
         // ── Status ──
         { type: 'separator', className: 'live-indicator',
           html: '<span id="last-update">—</span><span class="pulse" title="Auto-refreshing every 5s"></span>' },
-        // ── Link ──
-        { type: 'link', label: '', icon: '{}', href: '/api/state',
-          title: 'View dashboard state as JSON' },
+        // {} JSON link removed — accessible at /api/state directly
         // ── Hidden keyboard-only shortcuts ──
         { key: 'v', noMod: true, hint: 'card/table', label: '', icon: '',
           action: function() { toggleView(); },
