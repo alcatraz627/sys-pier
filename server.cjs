@@ -28,6 +28,8 @@ const PORT = process.env.PORT_BACKEND || 5042;
 const HOST = '127.0.0.1'; // localhost-only; blocks all external access at OS level
 
 const SERVER_STARTED = Date.now();
+const CLIENT_LOG_DIR = path.join(__dirname, 'client-logs');
+if (!fs.existsSync(CLIENT_LOG_DIR)) fs.mkdirSync(CLIENT_LOG_DIR, { recursive: true });
 
 // ── Config persistence ─────────────────────────────────────────────────────
 // Stores UI preferences: groups, colors, titles, ordering, merges, static URLs.
@@ -2316,7 +2318,7 @@ function renderPage(processes) {
     </div>
     <div class="search-wrap">
       <span class="search-icon">⌕</span>
-      <input class="search-input" id="search-input" type="text" placeholder="filter… (/)"
+      <input class="search-input" id="search-input" type="text" placeholder="filter… (/)" aria-label="Filter processes"
         oninput="applySearch(this.value)"
         title="Filter processes by name. Press / to focus, Esc to clear.">
     </div>
@@ -2451,7 +2453,7 @@ function renderPage(processes) {
 
         <h3>API</h3>
         <p>This dashboard is backed by a REST API. <code>GET /api</code> returns full documentation. Example:</p>
-        <p><code>curl http://localhost:5042/api/processes/json | jq '.[].name'</code></p>
+        <p><code>curl http://localhost:${PORT}/api/processes/json | jq '.[].name'</code></p>
         <p>All endpoints are localhost-only — the server binds to <code>127.0.0.1</code> and rejects non-loopback connections.</p>
 
         <h3>Keyboard Shortcuts</h3>
@@ -2527,6 +2529,35 @@ function renderPage(processes) {
   <div class="hint-bar" id="hint-bar"></div>
 
   <script>
+    // ── Client-side console logging ──────────────────────────────────────
+    (function() {
+      var _logQueue = [];
+      var _origError = console.error;
+      var _origWarn = console.warn;
+      function _pushLog(level, args) {
+        _logQueue.push({ level: level, message: Array.from(args).map(String).join(' '), ts: new Date().toISOString() });
+        if (_logQueue.length >= 5) _flushLogs();
+      }
+      function _flushLogs() {
+        if (!_logQueue.length) return;
+        var batch = _logQueue.splice(0);
+        navigator.sendBeacon('/api/client-logs', JSON.stringify(batch));
+      }
+      console.error = function() { _origError.apply(console, arguments); _pushLog('error', arguments); };
+      console.warn = function() { _origWarn.apply(console, arguments); _pushLog('warn', arguments); };
+      window.addEventListener('error', function(e) {
+        _pushLog('error', [e.message + ' at ' + (e.filename || '?') + ':' + (e.lineno || '?')]);
+      });
+      window.addEventListener('unhandledrejection', function(e) {
+        _pushLog('error', ['Unhandled rejection: ' + (e.reason && e.reason.message || e.reason || 'unknown')]);
+      });
+      setInterval(_flushLogs, 10000);
+      window.addEventListener('beforeunload', _flushLogs);
+    })();
+
+    // ── Client-side HTML escape ──────────────────────────────────────────
+    function _esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
     // ── Dashboard config (synced from server) ─────────────────────────────
     let DASH_CONFIG = ${JSON.stringify(CONFIG)};
     const COLOR_PALETTE = ${JSON.stringify(COLOR_PALETTE)};
@@ -3623,15 +3654,17 @@ function renderPage(processes) {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ collapsed: nowCollapsed }),
-      }).then(() => refresh());
+      }).then(() => refresh()).catch(() => toast('Failed to save collapse state', 'err'));
     }
 
     async function doGroupAction(cmd, gid) {
-      const entries = Object.entries(DASH_CONFIG.entries || {}).filter(([,v]) => v.group === gid).map(([k]) => k);
-      for (const name of entries) { await fetch('/api/action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cmd, name }) }); }
-      const gname = (DASH_CONFIG.groups[gid] || {}).name || gid;
-      toast(cmd + ' all in ' + gname + ' ✓', 'ok');
-      setTimeout(refresh, 800);
+      try {
+        const entries = Object.entries(DASH_CONFIG.entries || {}).filter(([,v]) => v.group === gid).map(([k]) => k);
+        for (const name of entries) { await fetch('/api/action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cmd, name }) }); }
+        const gname = (DASH_CONFIG.groups[gid] || {}).name || gid;
+        toast(cmd + ' all in ' + gname + ' ✓', 'ok');
+        setTimeout(refresh, 800);
+      } catch { toast('Group action failed', 'err'); }
     }
 
     function startGroupNameEdit(gid, el) {
@@ -4024,9 +4057,11 @@ function renderPage(processes) {
 
     async function deleteStaticUrl(slug) {
       if (!confirm('Remove static URL "' + slug + '"?')) return;
-      await fetch('/api/static-urls/' + encodeURIComponent(slug), { method: 'DELETE' });
-      toast('Removed ' + slug, 'ok');
-      refresh();
+      try {
+        await fetch('/api/static-urls/' + encodeURIComponent(slug), { method: 'DELETE' });
+        toast('Removed ' + slug, 'ok');
+        refresh();
+      } catch { toast('Failed to remove ' + slug, 'err'); }
     }
 
     // ── Merge/unmerge ─────────────────────────────────────────────────────
@@ -4068,6 +4103,7 @@ function renderPage(processes) {
           });
           if (!res.ok) { t.error('Server rejected config'); return; }
           var fresh = await fetch('/api/config');
+          if (!fresh.ok) { t.error('Failed to reload config'); return; }
           DASH_CONFIG = await fresh.json();
           t.done('Config imported (' + Object.keys(cfg.groups || {}).length + ' groups, ' + Object.keys(cfg.entries || {}).length + ' entries)');
           renderConfigTab(currentConfigTab);
@@ -4354,6 +4390,7 @@ function renderPage(processes) {
     async function detectMerges() {
       try {
         const res = await fetch('/api/merges/suggestions');
+        if (!res.ok) { toast('Failed to detect merges', 'err'); return; }
         const data = await res.json();
         const container = document.getElementById('merge-candidates');
         if (!data.length) { container.innerHTML = '<span style="color:var(--text-faint);font-size:0.7rem">No merge candidates found</span>'; return; }
@@ -4368,15 +4405,18 @@ function renderPage(processes) {
     }
 
     async function quickMerge(key, entries) {
-      await fetch('/api/merges', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ key, entries }),
-      });
-      const res = await fetch('/api/config');
-      DASH_CONFIG = await res.json();
-      toast('Merged ' + key, 'ok');
-      renderConfigTab('merges');
-      refresh();
+      try {
+        var r = await fetch('/api/merges', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key, entries }),
+        });
+        if (!r.ok) { toast('Merge failed: server error', 'err'); return; }
+        const res = await fetch('/api/config');
+        if (res.ok) DASH_CONFIG = await res.json();
+        toast('Merged ' + key, 'ok');
+        renderConfigTab('merges');
+        refresh();
+      } catch { toast('Merge failed', 'err'); }
     }
 
     async function assignGroup(name, group) {
@@ -4468,7 +4508,7 @@ function renderPage(processes) {
           evtSource.close();
           _scanEvtSource = null;
           document.getElementById('scan-content').innerHTML =
-            '<div style="padding:1.25rem;color:var(--red)">Scan failed: ' + data.message + '</div>';
+            '<div style="padding:1.25rem;color:var(--red)">Scan failed: ' + _esc(data.message) + '</div>';
         }
       };
       evtSource.onerror = () => {
@@ -4532,9 +4572,9 @@ function renderPage(processes) {
 
     function renderScanCandidate(c, isManaged) {
       const signals = c.signals.map(s => {
-        if (s.type === 'ecosystem') return '<span class="scan-signal eco">⚙ ' + s.file + (s.apps ? ' (' + s.apps + ' app' + (s.apps > 1 ? 's' : '') + ')' : '') + '</span>';
-        if (s.type === 'package') return '<span class="scan-signal pkg">📦 ' + (s.scripts.length ? s.scripts.join(', ') : 'package.json') + '</span>';
-        if (s.type === 'entry') return '<span class="scan-signal entry">▸ ' + s.file + '</span>';
+        if (s.type === 'ecosystem') return '<span class="scan-signal eco">⚙ ' + _esc(s.file) + (s.apps ? ' (' + s.apps + ' app' + (s.apps > 1 ? 's' : '') + ')' : '') + '</span>';
+        if (s.type === 'package') return '<span class="scan-signal pkg">📦 ' + (s.scripts.length ? _esc(s.scripts.join(', ')) : 'package.json') + '</span>';
+        if (s.type === 'entry') return '<span class="scan-signal entry">▸ ' + _esc(s.file) + '</span>';
         return '';
       }).join(' ');
 
@@ -4550,7 +4590,7 @@ function renderPage(processes) {
       return '<div class="scan-candidate' + (isManaged ? ' managed' : '') + '">' +
         (isManaged
           ? '<span style="font-size:0.7rem;color:var(--green);flex-shrink:0">✓</span>'
-          : '<input type="checkbox" data-scan-path="' + c.path + '" data-scan-name="' + c.name + '" onchange="updateScanSelection()">') +
+          : '<input type="checkbox" data-scan-path="' + c.path + '" data-scan-name="' + c.name + '" onchange="updateScanSelection()" aria-label="Select ' + _esc(c.name) + '">') +
         '<div style="flex:1;min-width:0">' +
           '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">' +
             '<strong style="color:var(--text-primary)">' + c.name + '</strong>' +
@@ -4674,7 +4714,7 @@ function renderPage(processes) {
 
 const API_DOCS = {
   version: '3.0',
-  base: 'http://localhost:5042',
+  base: 'http://localhost:' + PORT,
   security: 'localhost-only (127.0.0.1 bind + remoteAddress check)',
   note: 'All write endpoints require POST. All responses are JSON unless noted.',
   endpoints: [
@@ -4741,6 +4781,26 @@ function handleRequest(req, res) {
     const processes = pm2List();
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(renderPage(processes));
+    return;
+  }
+
+  // Client-side console log ingestion (error auditing)
+  if (req.method === 'POST' && path === '/api/client-logs') {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; if (body.length > 50000) req.destroy(); });
+    req.on('end', () => {
+      try {
+        const entries = JSON.parse(body);
+        if (!Array.isArray(entries)) { res.writeHead(400); res.end(); return; }
+        const date = new Date().toISOString().slice(0, 10);
+        const logFile = CLIENT_LOG_DIR + '/' + date + '.log';
+        const lines = entries.map((e) =>
+          `[${e.ts || new Date().toISOString()}] ${(e.level || 'info').toUpperCase()} ${e.message || ''}`
+        ).join('\n') + '\n';
+        fs.appendFileSync(logFile, lines);
+        res.writeHead(204); res.end();
+      } catch { res.writeHead(400); res.end(); }
+    });
     return;
   }
 

@@ -13,6 +13,9 @@ _*.claude.md
 _precompact-checkpoint.claude.md
 .claude/
 
+# Client browser logs (error auditing)
+client-logs/
+
 # OS files
 .DS_Store
 Thumbs.db
