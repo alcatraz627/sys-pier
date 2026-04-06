@@ -1313,7 +1313,7 @@ function renderPage(processes) {
       margin-top: 2px;
       padding-top: 4px;
       border-top: 1px solid var(--border-subtle);
-      cursor: help;
+      cursor: default;
     }
 
     /* ── Card actions ───────────────────────────────────────────────────── */
@@ -1831,10 +1831,8 @@ function renderPage(processes) {
       text-align: center;
     }
 
-    /* ── Tooltip ────────────────────────────────────────────────────────── */
-    [title] { cursor: help; }
-    .btn[title] { cursor: pointer; }
-    .port-link[title] { cursor: pointer; }
+    /* ── Tooltip cursor — only on informational elements, not interactive ones */
+    .status-dot[title], .badge[title], .no-port[title], .proc-id[title] { cursor: help; }
 
     /* ── Drag handle ───────────────────────────────────────────────────── */
     .drag-handle {
@@ -2440,17 +2438,29 @@ function renderPage(processes) {
         } else {
           // Smart patch: update only changed content within existing cards
           patchCardsInPlace(data.processes, grid);
-          // Also update group counts and headers if in grouped view
+          // Also update group headers (emoji, name, count, notes) if in grouped view
           if (grouped) {
-            tmp.querySelectorAll('.group-count').forEach(newCount => {
-              const section = newCount.closest('.group-section');
-              if (!section) return;
-              const gid = section.dataset.group;
+            tmp.querySelectorAll('.group-section').forEach(newSection => {
+              const gid = newSection.dataset.group;
               const oldSection = grid.querySelector('.group-section[data-group="' + gid + '"]');
-              if (oldSection) {
-                const oldCount = oldSection.querySelector('.group-count');
-                if (oldCount) oldCount.textContent = newCount.textContent;
-              }
+              if (!oldSection) return;
+              var el;
+              el = newSection.querySelector('.group-emoji');
+              var oldEl = oldSection.querySelector('.group-emoji');
+              if (el && oldEl && el.textContent !== oldEl.textContent) oldEl.textContent = el.textContent;
+              el = newSection.querySelector('.group-name');
+              oldEl = oldSection.querySelector('.group-name');
+              if (el && oldEl && el.textContent !== oldEl.textContent) oldEl.textContent = el.textContent;
+              el = newSection.querySelector('.group-count');
+              oldEl = oldSection.querySelector('.group-count');
+              if (el && oldEl && el.textContent !== oldEl.textContent) oldEl.textContent = el.textContent;
+              el = newSection.querySelector('.group-notes');
+              oldEl = oldSection.querySelector('.group-notes');
+              if (el && oldEl) oldEl.textContent = el.textContent;
+              else if (el && !oldEl) {
+                var header = oldSection.querySelector('.group-header');
+                if (header) { var s = document.createElement('span'); s.className = 'group-notes'; s.textContent = el.textContent; header.insertBefore(s, header.querySelector('.group-collapse-btn')); }
+              } else if (!el && oldEl) oldEl.remove();
             });
           }
         }
@@ -2635,9 +2645,24 @@ function renderPage(processes) {
       document.querySelectorAll('.card[data-name]').forEach((card) => {
         card.style.display = (!term || card.dataset.name.toLowerCase().includes(term)) ? '' : 'none';
       });
+      // Hide group sections where all children are hidden
+      document.querySelectorAll('.group-section').forEach((section) => {
+        const visibleCards = section.querySelectorAll('.card[data-name]:not([style*="display: none"])');
+        section.style.display = (!term || visibleCards.length > 0) ? '' : 'none';
+      });
       if (currentView === 'table') {
         document.querySelectorAll('#table-body tr[data-name]').forEach((row) => {
           row.style.display = (!term || row.dataset.name.toLowerCase().includes(term)) ? '' : 'none';
+        });
+        // Hide table group headers where all children are hidden
+        document.querySelectorAll('.tbl-group-header').forEach((header) => {
+          var next = header.nextElementSibling;
+          var anyVisible = false;
+          while (next && !next.classList.contains('tbl-group-header')) {
+            if (next.style.display !== 'none') anyVisible = true;
+            next = next.nextElementSibling;
+          }
+          header.style.display = (!term || anyVisible) ? '' : 'none';
         });
       }
     }
