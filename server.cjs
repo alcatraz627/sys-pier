@@ -1766,6 +1766,9 @@ function renderPage(processes) {
     }
     .process-table .tbl-group-header .group-emoji { font-size: 0.85rem; }
     .tbl-sparkline { width: 80px; height: 20px; display: block; }
+    #table-body tr.drag-over-top { box-shadow: inset 0 3px 0 0 var(--accent); }
+    #table-body tr.drag-over-bottom { box-shadow: inset 0 -3px 0 0 var(--accent); }
+    #table-body tr.drag-source { opacity: 0.35; }
 
     /* ── Global stats bar ───────────────────────────────────────────────── */
     .stats-bar {
@@ -3373,7 +3376,17 @@ function renderPage(processes) {
       e.dataTransfer.effectAllowed = 'move';
       e.dataTransfer.setData('text/plain', name);
       const card = e.target.closest('.card') || e.target.closest('tr');
-      if (card) card.classList.add('drag-source');
+      if (card) {
+        card.classList.add('drag-source');
+        // Create a floating ghost of the card
+        if (card.classList.contains('card')) {
+          var ghost = card.cloneNode(true);
+          ghost.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:' + card.offsetWidth + 'px;opacity:0.85;transform:scale(0.85);pointer-events:none;z-index:9999;border:2px solid var(--accent);border-radius:var(--radius)';
+          document.body.appendChild(ghost);
+          e.dataTransfer.setDragImage(ghost, card.offsetWidth / 2, 20);
+          setTimeout(function() { ghost.remove(); }, 0);
+        }
+      }
     }
 
     function clearDragIndicators() {
@@ -3408,19 +3421,24 @@ function renderPage(processes) {
           clearDragIndicators();
           const target = card.dataset.name;
           if (!dragSourceName || dragSourceName === target) return;
-          // Build new order — insert before or after target based on drop position
-          const allCards = [...document.querySelectorAll('.card[data-name]')].map((c) => c.dataset.name);
-          const filtered = allCards.filter((n) => n !== dragSourceName);
-          let idx = filtered.indexOf(target);
-          if (pos === 'bottom') idx += 1;
-          filtered.splice(idx, 0, dragSourceName);
+          // Instant DOM reorder (optimistic update)
+          const sourceCard = document.querySelector('.card[data-name="' + CSS.escape(dragSourceName) + '"]');
+          if (sourceCard && card.parentElement) {
+            sourceCard.classList.remove('drag-source');
+            if (pos === 'top') {
+              card.parentElement.insertBefore(sourceCard, card);
+            } else {
+              card.parentElement.insertBefore(sourceCard, card.nextSibling);
+            }
+          }
+          // Build new order from current DOM state and persist
+          const allCards = [...document.querySelectorAll('.card[data-name]')].map(function(c) { return c.dataset.name; });
           try {
             await fetch('/api/order', {
               method: 'PUT', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ order: filtered }),
+              body: JSON.stringify({ order: allCards }),
             });
             toast('Order updated', 'ok');
-            refresh();
           } catch(e) { toast('Failed to save order', 'err'); }
         });
         card.addEventListener('dragend', () => {
@@ -3430,6 +3448,58 @@ function renderPage(processes) {
         });
       });
     }
+
+    // ── Table row drag-drop (event delegation on tbody) ───────────────
+    (function() {
+      var tbody = document.getElementById('table-body');
+      if (!tbody) return;
+      tbody.addEventListener('dragover', function(e) {
+        if (!dragSourceName) return;
+        var row = e.target.closest('tr[data-name]');
+        if (!row) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+        clearDragIndicators();
+        var pos = getDragPosition(e, row);
+        row.classList.add(pos === 'top' ? 'drag-over-top' : 'drag-over-bottom');
+      });
+      tbody.addEventListener('dragleave', function(e) {
+        var row = e.target.closest('tr[data-name]');
+        if (row && !row.contains(e.relatedTarget)) {
+          row.classList.remove('drag-over-top', 'drag-over-bottom');
+        }
+      });
+      tbody.addEventListener('drop', async function(e) {
+        var row = e.target.closest('tr[data-name]');
+        if (!row || !dragSourceName) return;
+        e.preventDefault();
+        var pos = getDragPosition(e, row);
+        clearDragIndicators();
+        var target = row.dataset.name;
+        if (dragSourceName === target) return;
+        // Instant DOM reorder
+        var sourceRow = tbody.querySelector('tr[data-name="' + CSS.escape(dragSourceName) + '"]');
+        if (sourceRow) {
+          sourceRow.classList.remove('drag-source');
+          if (pos === 'top') {
+            row.parentElement.insertBefore(sourceRow, row);
+          } else {
+            row.parentElement.insertBefore(sourceRow, row.nextSibling);
+          }
+        }
+        // Persist order from table rows
+        var allRows = tbody.querySelectorAll('tr[data-name]');
+        var order = [];
+        allRows.forEach(function(r) { order.push(r.dataset.name); });
+        try {
+          await fetch('/api/order', {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ order: order }),
+          });
+          toast('Order updated', 'ok');
+        } catch(e) { toast('Failed to save order', 'err'); }
+      });
+    })();
 
     function onGroupDragOver(e) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; }
 
