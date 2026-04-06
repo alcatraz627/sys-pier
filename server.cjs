@@ -1121,12 +1121,14 @@ function renderPage(processes) {
     .proc-count {
       font-size: 0.7rem;
       color: var(--text-secondary);
-      padding: 3px 9px;
+      padding: 4px 9px;
       background: var(--bg-tertiary);
       border: 1px solid var(--border);
       border-radius: 100px;
-      line-height: 1.3;
+      line-height: 1;
       white-space: nowrap;
+      margin-left: 8px;
+      margin-right: 4px;
     }
 
     .header-right {
@@ -1142,15 +1144,20 @@ function renderPage(processes) {
     .nav-group {
       display: inline-flex;
       align-items: center;
-      gap: 3px;
-      background: rgba(255, 255, 255, 0.04);
-      border: 1px solid rgba(255, 255, 255, 0.08);
+      gap: 2px;
+      background: transparent;
+      border: 1px solid transparent;
       border-radius: 6px;
-      padding: 2px 3px;
+      padding: 2px 2px;
     }
     .nav-group .hdr-btn {
       border-color: transparent;
-      padding: 4px 7px;
+      padding: 5px 8px;
+      filter: grayscale(0.6) brightness(1.1);
+      transition: filter 0.2s ease, background 0.15s, color 0.15s;
+    }
+    .nav-group .hdr-btn:hover {
+      filter: grayscale(0) brightness(1.2);
     }
     .nav-sep {
       width: 1px;
@@ -1176,9 +1183,10 @@ function renderPage(processes) {
       font-family: var(--font-mono);
       font-size: 0.75rem;
       padding: 5px 10px;
-      transition: background 0.15s, color 0.15s;
+      transition: background 0.15s, color 0.15s, opacity 0.15s;
       white-space: nowrap;
       line-height: 1.3;
+      opacity: 0.55;
     }
     .seg-toggle .seg-opt:not(:last-child) {
       border-right: 1px solid var(--border);
@@ -1186,20 +1194,22 @@ function renderPage(processes) {
     .seg-toggle .seg-opt:hover {
       color: var(--text-secondary);
       background: var(--bg-hover);
+      opacity: 0.85;
     }
     .seg-toggle .seg-opt.active {
       background: var(--accent-bg);
       color: var(--accent);
       font-weight: 600;
       text-shadow: 0 0 8px rgba(99, 102, 241, 0.3);
+      opacity: 1;
     }
 
     .live-indicator {
       display: flex;
       align-items: center;
       gap: 5px;
-      font-size: 0.68rem;
-      color: var(--text-faint);
+      font-size: 0.7rem;
+      color: var(--text-muted);
       padding: 0 0.1rem;
     }
 
@@ -1235,6 +1245,11 @@ function renderPage(processes) {
     .nav-group .hdr-btn.primary:hover { background: var(--bg-hover); border-color: transparent; color: var(--accent); }
     .hdr-btn.save:hover { color: var(--green); }
     .hdr-btn.help:hover { color: var(--text-primary); }
+    .hdr-btn:focus-visible,
+    .seg-opt:focus-visible {
+      outline: 1.5px solid var(--accent);
+      outline-offset: 1px;
+    }
 
     /* ── Grid ───────────────────────────────────────────────────────────── */
     .grid {
@@ -1787,12 +1802,20 @@ function renderPage(processes) {
       bottom: 0; left: 0; right: 0;
       background: var(--bg-tertiary);
       border-top: 1px solid var(--border);
-      padding: 3px 1.5rem;
+      padding: 4px 1.5rem;
       display: flex;
-      gap: 1.25rem;
-      font-size: 0.7rem;
+      gap: 0.75rem;
+      font-size: 0.65rem;
       color: var(--text-faint);
       z-index: 50;
+      letter-spacing: 0.04em;
+    }
+    .hint-sep {
+      width: 1px;
+      height: 10px;
+      background: var(--border);
+      align-self: center;
+      flex-shrink: 0;
     }
     .hint-bar kbd {
       display: inline-block;
@@ -1802,6 +1825,8 @@ function renderPage(processes) {
       padding: 0 4px;
       font-size: 0.68rem;
       color: var(--text-muted);
+      letter-spacing: 0.02em;
+      font-weight: 500;
     }
 
     /* ── Sparkline canvas ───────────────────────────────────────────────── */
@@ -1851,10 +1876,10 @@ function renderPage(processes) {
       color: var(--text-primary);
       padding: 5px 10px 5px 24px;
       width: 130px;
-      transition: border-color 0.15s, width 0.25s ease, background 0.15s;
+      transition: border-color 0.15s, width 0.25s ease, background 0.15s, box-shadow 0.15s;
       min-width: 70px;
     }
-    .search-input:focus { outline: none; border-color: var(--accent); width: 220px; background: var(--bg-secondary); }
+    .search-input:focus { outline: none; border-color: var(--accent); width: 220px; background: var(--bg-secondary); box-shadow: 0 0 6px rgba(99, 102, 241, 0.15); }
     .search-input::placeholder { color: var(--text-faint); }
 
     /* ── Process table view ─────────────────────────────────────────────── */
@@ -3384,12 +3409,20 @@ function renderPage(processes) {
 
       _renderHintBar() {
         if (!this.hintBar) return;
-        const hints = this.actions
-          .filter(a => a.key && a.type !== 'separator' && a.type !== 'link')
-          .map(a => '<span><kbd>' + this._displayKey(a.key) + '</kbd> ' + a.hint + '</span>');
-        // Always append Escape
-        hints.push('<span><kbd>Esc</kbd> close/clear</span>');
-        this.hintBar.innerHTML = hints.join('');
+        var sep = '<span class="hint-sep"></span>';
+        var items = this.actions.filter(a => a.key && a.type !== 'separator' && a.type !== 'link');
+        var html = '';
+        var lastGroup = null;
+        for (var i = 0; i < items.length; i++) {
+          var a = items[i];
+          // Insert separator between hint groups: actions (s,d), nav (v,g,r), settings (c,?,t), search (/)
+          var hGroup = 'sdDR'.indexOf(a.key) >= 0 ? 'act' : 'vgr'.indexOf(a.key) >= 0 ? 'nav' : 'ct?'.indexOf(a.key) >= 0 ? 'set' : 'oth';
+          if (lastGroup && hGroup !== lastGroup) html += sep;
+          lastGroup = hGroup;
+          html += '<span><kbd>' + this._displayKey(a.key) + '</kbd> ' + a.hint + '</span>';
+        }
+        html += sep + '<span><kbd>Esc</kbd> close/clear</span>';
+        this.hintBar.innerHTML = html;
       }
 
       _attachKeyboard() {
