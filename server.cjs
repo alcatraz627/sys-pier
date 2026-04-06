@@ -1647,6 +1647,7 @@ function renderPage(processes) {
     }
     .toast.ok  { border-color: var(--green);  color: var(--green); }
     .toast.err { border-color: var(--danger); color: var(--danger); }
+    .toast.loading { border-color: var(--accent); color: var(--accent); opacity: 0.8; }
     @keyframes toast-in {
       from { opacity: 0; transform: translateX(8px); }
       to   { opacity: 1; transform: translateX(0); }
@@ -3185,7 +3186,17 @@ function renderPage(processes) {
       el.className = 'toast ' + type;
       el.textContent = msg;
       document.getElementById('toasts').appendChild(el);
-      setTimeout(() => el.remove(), 3500);
+      setTimeout(() => el.remove(), type === 'err' ? 5000 : 3500);
+      return el;
+    }
+
+    // Async toast: shows loading message, returns object with .done(msg) and .error(msg)
+    function toastAsync(loadingMsg) {
+      const el = toast(loadingMsg + '…', 'loading');
+      return {
+        done: function(msg) { el.textContent = msg; el.className = 'toast ok'; clearTimeout(el._t); el._t = setTimeout(function() { el.remove(); }, 3500); },
+        error: function(msg) { el.textContent = msg; el.className = 'toast err'; clearTimeout(el._t); el._t = setTimeout(function() { el.remove(); }, 5000); },
+      };
     }
 
     // ── Group view toggle ─────────────────────────────────────────────────
@@ -3286,21 +3297,24 @@ function renderPage(processes) {
 
     async function setColor(name, color) {
       closeColorPicker();
-      if (name.startsWith('static:')) {
-        const slug = name.slice(7);
-        await fetch('/api/static-urls/' + encodeURIComponent(slug), {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ color: color || null }),
-        });
-      } else {
-        await fetch('/api/config/entry/' + encodeURIComponent(name), {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ color: color || null }),
-        });
-      }
-      refresh();
+      try {
+        if (name.startsWith('static:')) {
+          const slug = name.slice(7);
+          await fetch('/api/static-urls/' + encodeURIComponent(slug), {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ color: color || null }),
+          });
+        } else {
+          await fetch('/api/config/entry/' + encodeURIComponent(name), {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ color: color || null }),
+          });
+        }
+        toast('Color updated', 'ok');
+        refresh();
+      } catch(e) { toast('Failed to set color', 'err'); }
     }
 
     // ── Custom title editing ──────────────────────────────────────────────
@@ -3326,6 +3340,9 @@ function renderPage(processes) {
         input.remove();
         el.style.display = '';
         if (titleSpan) titleSpan.style.display = '';
+        if (val === current) return; // no change
+        var t = toastAsync('Renaming ' + name);
+        try {
         if (name.startsWith('static:')) {
           await fetch('/api/static-urls/' + encodeURIComponent(name.slice(7)), {
             method: 'PATCH', headers: { 'Content-Type': 'application/json' },
@@ -3337,7 +3354,9 @@ function renderPage(processes) {
             body: JSON.stringify({ title: val || null }),
           });
         }
+        t.done('Renamed: ' + (val || name));
         refresh();
+        } catch(e) { t.error('Failed to rename'); }
       };
       input.addEventListener('blur', save, { once: true });
       input.addEventListener('keydown', (e) => {
@@ -3395,11 +3414,14 @@ function renderPage(processes) {
           let idx = filtered.indexOf(target);
           if (pos === 'bottom') idx += 1;
           filtered.splice(idx, 0, dragSourceName);
-          await fetch('/api/order', {
-            method: 'PUT', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ order: filtered }),
-          });
-          refresh();
+          try {
+            await fetch('/api/order', {
+              method: 'PUT', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ order: filtered }),
+            });
+            toast('Order updated', 'ok');
+            refresh();
+          } catch(e) { toast('Failed to save order', 'err'); }
         });
         card.addEventListener('dragend', () => {
           card.classList.remove('drag-source');
@@ -3414,12 +3436,16 @@ function renderPage(processes) {
     async function onGroupDrop(e, gid) {
       e.preventDefault();
       if (!dragSourceName || dragSourceName.startsWith('static:')) return;
-      await fetch('/api/config/entry/' + encodeURIComponent(dragSourceName), {
-        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ group: gid || null }),
-      });
-      dragSourceName = null;
-      refresh();
+      const grpName = gid ? ((DASH_CONFIG.groups[gid] || {}).name || gid) : 'ungrouped';
+      try {
+        await fetch('/api/config/entry/' + encodeURIComponent(dragSourceName), {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ group: gid || null }),
+        });
+        toast(dragSourceName + ' → ' + grpName, 'ok');
+        dragSourceName = null;
+        refresh();
+      } catch(e) { toast('Failed to move to group', 'err'); }
     }
 
     // ── Static URL health check ───────────────────────────────────────────
@@ -3648,14 +3674,20 @@ function renderPage(processes) {
     }
 
     async function updateGroup(id, updates) {
-      await fetch('/api/groups/' + encodeURIComponent(id), {
-        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(updates),
-      });
-      const res = await fetch('/api/config');
-      DASH_CONFIG = await res.json();
-      renderConfigTab('groups');
-      refresh();
+      const gname = (DASH_CONFIG.groups[id] || {}).name || id;
+      const what = Object.keys(updates).join(', ');
+      var t = toastAsync('Updating ' + gname);
+      try {
+        await fetch('/api/groups/' + encodeURIComponent(id), {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(updates),
+        });
+        const res = await fetch('/api/config');
+        DASH_CONFIG = await res.json();
+        t.done('Updated ' + gname + ' (' + what + ')');
+        renderConfigTab('groups');
+        refresh();
+      } catch(e) { t.error('Failed to update ' + gname); }
     }
 
     async function addGroup() {
@@ -3749,13 +3781,18 @@ function renderPage(processes) {
     }
 
     async function assignGroup(name, group) {
-      await fetch('/api/config/entry/' + encodeURIComponent(name), {
-        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ group: group || null }),
-      });
-      const res = await fetch('/api/config');
-      DASH_CONFIG = await res.json();
-      refresh();
+      const grpName = group ? ((DASH_CONFIG.groups[group] || {}).name || group) : 'ungrouped';
+      var t = toastAsync('Moving ' + name);
+      try {
+        await fetch('/api/config/entry/' + encodeURIComponent(name), {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ group: group || null }),
+        });
+        const res = await fetch('/api/config');
+        DASH_CONFIG = await res.json();
+        t.done(name + ' → ' + grpName);
+        refresh();
+      } catch(e) { t.error('Failed to move ' + name); }
     }
 
     // ── Entry lane drag-and-drop ────────────────────────────────────────
