@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# User-specific config (contains process details, group settings, order preferences)
+pm2-manage-config.json
+
+# Environment
+.env
+.env.*
+
+# Claude session artifacts
+_*.claude.md
+_precompact-checkpoint.claude.md
+.claude/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
