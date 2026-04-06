@@ -281,6 +281,41 @@ function metricsSnapshot() {
 
 setInterval(() => { try { recordMetrics(pm2List()); } catch {} }, 5000);
 
+// ── Static URL health history ─────────────────────────────────────────────
+// Rolling 20-sample window (~10 min at 30s intervals) of latency + status per URL.
+
+const HEALTH_HISTORY_LENGTH = 20;
+const healthHistory = new Map(); // slug → { latency: number[], ok: boolean[] }
+
+async function recordHealthChecks() {
+  const urls = CONFIG.staticUrls || {};
+  for (const [slug, entry] of Object.entries(urls)) {
+    if (!entry.url) continue;
+    try {
+      const result = await checkUrlHealth(entry.url);
+      if (!healthHistory.has(slug)) healthHistory.set(slug, { latency: [], ok: [] });
+      const h = healthHistory.get(slug);
+      h.latency.push(result.latency_ms);
+      h.ok.push(result.ok);
+      if (h.latency.length > HEALTH_HISTORY_LENGTH) { h.latency.shift(); h.ok.shift(); }
+    } catch {}
+  }
+  // Clean up slugs that no longer exist in config
+  for (const slug of healthHistory.keys()) {
+    if (!urls[slug]) healthHistory.delete(slug);
+  }
+}
+
+function healthSnapshot() {
+  const out = {};
+  healthHistory.forEach((h, slug) => { out[slug] = { latency: [...h.latency], ok: [...h.ok] }; });
+  return out;
+}
+
+setInterval(() => { recordHealthChecks().catch(() => {}); }, 30000);
+// Initial check after 2s to populate history on startup
+setTimeout(() => { recordHealthChecks().catch(() => {}); }, 2000);
+
 // ── Security ───────────────────────────────────────────────────────────────
 // Binding to 127.0.0.1 is the primary guard. This is a defense-in-depth
 // second check in case a misconfigured proxy forwards external traffic.
@@ -561,6 +596,7 @@ function renderStaticUrlCard(slug, entry) {
     <div class="port-block">
       <a href="${escHtml(entry.url)}" target="_blank" class="port-link url-link" title="${escHtml(entry.url)}">${escHtml(entry.url)} ↗</a>
     </div>
+    <canvas class="sparkline health-sparkline" data-health-slug="${escHtml(slug)}" title="Response latency over time (sampled every 30s). Green = healthy, red = error."></canvas>
   </div>
   <div class="card-actions">
     <button class="btn" onclick="checkHealth('${escHtml(slug)}')" title="Check URL health">♡ Health</button>
@@ -2448,6 +2484,7 @@ function renderPage(processes) {
     let firstLoad = true;
     let lastProcesses = []; // used by table view
     let lastMetrics = null; // used to redraw sparklines on view toggle
+    let lastHealthMetrics = null; // used to redraw health sparklines on view toggle
     let _lastGroupView = null; // track view mode to detect full-rebuild needs
 
     async function refresh() {
@@ -2521,12 +2558,14 @@ function renderPage(processes) {
 
         if (data.stats)    updateStatsBar(data.stats);
         if (data.metrics) { lastMetrics = data.metrics; drawSparklines(data.metrics); }
+        if (data.healthMetrics) { lastHealthMetrics = data.healthMetrics; drawHealthSparklines(data.healthMetrics); }
         if (data.processes) {
           lastProcesses = data.processes;
           if (currentView === 'table') {
             renderTable(lastProcesses);
             // Re-draw sparklines after table rebuild creates new canvas elements
             if (data.metrics) drawSparklines(data.metrics);
+            if (lastHealthMetrics) drawHealthSparklines(lastHealthMetrics);
           }
         }
 
@@ -2688,6 +2727,49 @@ function renderPage(processes) {
       ctx.globalAlpha = 1;
     }
 
+    // ── Health sparklines (static URLs) ──────────────────────────────────
+    function drawHealthSparklines(healthMetrics) {
+      const style = getComputedStyle(document.documentElement);
+      const green = style.getPropertyValue('--green').trim();
+      const red   = style.getPropertyValue('--red').trim() || '#e55';
+      const accent = style.getPropertyValue('--accent').trim();
+      document.querySelectorAll('canvas.health-sparkline').forEach(function(canvas) {
+        const slug = canvas.dataset.healthSlug;
+        if (!slug) return;
+        const h = healthMetrics[slug];
+        if (!h || !h.latency || h.latency.length < 2) return;
+        const dpr = window.devicePixelRatio || 1;
+        const w = canvas.clientWidth || canvas.offsetWidth || 280;
+        const ht = canvas.clientHeight || canvas.offsetHeight || 32;
+        canvas.width  = w * dpr;
+        canvas.height = ht * dpr;
+        const ctx = canvas.getContext('2d');
+        ctx.scale(dpr, dpr);
+        ctx.clearRect(0, 0, w, ht);
+        var maxLatency = Math.max.apply(null, h.latency.concat([100]));
+        // Draw colored background segments for ok/error status
+        var segW = w / h.ok.length;
+        h.ok.forEach(function(ok, i) {
+          if (!ok) {
+            ctx.fillStyle = red;
+            ctx.globalAlpha = 0.15;
+            ctx.fillRect(i * segW, 0, segW, ht);
+            ctx.globalAlpha = 1;
+          }
+        });
+        // Draw latency line — green if all ok, accent otherwise
+        var allOk = h.ok.every(function(v) { return v; });
+        drawSparkLine(ctx, h.latency, w, ht, allOk ? green : accent, maxLatency);
+        // Update the health dot on the card if present
+        var dot = document.getElementById('health-' + slug) || document.getElementById('tbl-health-' + slug);
+        if (dot) {
+          var lastOk = h.ok[h.ok.length - 1];
+          dot.className = dot.className.replace(/ ?(healthy|error|redirect|unknown)/g, '') + (lastOk ? ' healthy' : ' error');
+          dot.title = h.latency[h.latency.length - 1] + 'ms';
+        }
+      });
+    }
+
     // ── Search ─────────────────────────────────────────────────────────────
     function applySearch(q) {
       const term = q.toLowerCase();
@@ -2733,6 +2815,7 @@ function renderPage(processes) {
       if (isTable && lastProcesses.length) {
         renderTable(lastProcesses);
         if (lastMetrics) drawSparklines(lastMetrics);
+        if (lastHealthMetrics) drawHealthSparklines(lastHealthMetrics);
       }
     }
 
@@ -2790,7 +2873,7 @@ function renderPage(processes) {
           + '<td style="color:var(--text-faint)">—</td>'
           + '<td class="tbl-port"><a href="' + (u.url || '') + '" target="_blank" style="font-size:0.72rem">' + (u.url || '').replace(/^https?:\\/\\//, '') + '</a></td>'
           + '<td>—</td><td>—</td><td>—</td><td>—</td>'
-          + '<td></td>'
+          + '<td><canvas class="tbl-sparkline health-sparkline" data-health-slug="' + slug + '" width="80" height="20"></canvas></td>'
           + '<td>' + groupLabel + '</td>'
           + '<td class="tbl-actions">'
           + '<button class="btn btn-sm" onclick="checkHealth(\\'' + slug + '\\')" title="Health check">♡</button>'
@@ -4430,6 +4513,7 @@ function handleRequest(req, res) {
       count: processes.length,
       stats,
       metrics: metricsSnapshot(),
+      healthMetrics: healthSnapshot(),
       processes: processes.map(summarizeProcess),
       config: CONFIG,
     }));
