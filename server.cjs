@@ -736,6 +736,8 @@ function renderCardsGrouped(processes) {
   // Build items with group assignment
   const items = [];
   for (const [key, entries] of Object.entries(merges)) {
+    // Skip merges where no member processes exist
+    if (!entries.some((n) => byName[n])) continue;
     const cfg = CONFIG.entries[key] || CONFIG.entries[entries[0]] || {};
     items.push({ key, group: cfg.group || null, html: renderMergedCard(key, entries, byName) });
   }
@@ -2547,6 +2549,14 @@ function renderPage(processes) {
                 var header = oldSection.querySelector('.group-header');
                 if (header) { var s = document.createElement('span'); s.className = 'group-notes'; s.textContent = el.textContent; header.insertBefore(s, header.querySelector('.group-collapse-btn')); }
               } else if (!el && oldEl) oldEl.remove();
+              // Sync collapsed state from server
+              var wasCollapsed = oldSection.classList.contains('collapsed');
+              var isCollapsed = newSection.classList.contains('collapsed');
+              if (wasCollapsed !== isCollapsed) {
+                oldSection.classList.toggle('collapsed', isCollapsed);
+                var colBtn = oldSection.querySelector('.group-collapse-btn');
+                if (colBtn) colBtn.textContent = isCollapsed ? '▸' : '▾';
+              }
             });
           }
         }
@@ -3211,8 +3221,9 @@ function renderPage(processes) {
 
       _attachKeyboard() {
         this._keydownHandler = (e) => {
-          if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
           const key = e.key;
+          // Let Escape through even in inputs (to clear/close), block other shortcuts
+          if (key !== 'Escape' && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
 
           if (key === 'Escape') {
             if (this.escHandler) this.escHandler();
@@ -3269,7 +3280,8 @@ function renderPage(processes) {
         document.querySelectorAll('.backdrop.open').forEach((el) => closeModal(el.id));
         closeThemePanel();
         const si = document.getElementById('search-input');
-        if (si.value) { si.value = ''; applySearch(''); si.blur(); }
+        if (si.value) { si.value = ''; applySearch(''); }
+        else { si.blur(); }
       },
       actions: [
         { id: 'view-btn',  label: 'Cards', icon: '⊞', key: 'v', noMod: true, hint: 'card/table',
@@ -3341,10 +3353,20 @@ function renderPage(processes) {
     }
 
     function toggleGroupCollapse(gid) {
+      const nowCollapsed = !(DASH_CONFIG.groups[gid]?.collapsed);
+      // Instant client-side toggle for responsive UX
+      if (DASH_CONFIG.groups[gid]) DASH_CONFIG.groups[gid].collapsed = nowCollapsed;
+      const section = document.querySelector('.group-section[data-group="' + CSS.escape(gid) + '"]');
+      if (section) {
+        section.classList.toggle('collapsed', nowCollapsed);
+        const btn = section.querySelector('.group-collapse-btn');
+        if (btn) btn.textContent = nowCollapsed ? '▸' : '▾';
+      }
+      // Persist to server
       fetch('/api/groups/' + encodeURIComponent(gid), {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ collapsed: !(DASH_CONFIG.groups[gid]?.collapsed) }),
+        body: JSON.stringify({ collapsed: nowCollapsed }),
       }).then(() => refresh());
     }
 
