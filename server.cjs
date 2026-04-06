@@ -2099,6 +2099,40 @@ function renderPage(processes) {
       font-weight: 700; min-width: 16px; height: 16px; border-radius: 8px;
       padding: 0 4px; margin-left: 4px; line-height: 1;
     }
+    /* ── Responsive breakpoints ────────────────────────────────────────── */
+    @media (max-width: 768px) {
+      body { padding: 0.5rem; }
+      header { flex-wrap: wrap; gap: 0.5rem; }
+      .header-right { flex-wrap: wrap; gap: 4px; }
+      .hdr-btn .hdr-kbd { display: none; }
+      .search-input { width: 100px; min-width: 60px; }
+      .search-input:focus { width: 140px; }
+      .stats-bar { flex-wrap: wrap; gap: 0.5rem 1rem; padding: 0.5rem 1rem; margin: -1rem -0.5rem 1rem; }
+      .stat-pill-sep { display: none; }
+      .grid { grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 0.625rem; }
+      .modal { width: 98%; max-height: 90vh; }
+      .config-form[style*="flex-direction:row"] { flex-wrap: wrap !important; }
+      .group-header { font-size: 0.85rem; }
+      .keyboard-hints { display: none; }
+      .entry-lanes { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
+    }
+    @media (max-width: 480px) {
+      body { padding: 0.375rem; }
+      .logo { font-size: 1rem; }
+      .proc-count { font-size: 0.6rem; }
+      .hdr-btn { padding: 3px 6px; font-size: 0.65rem; }
+      .grid { grid-template-columns: 1fr; }
+      .card-body { padding: 0.5rem 0.75rem 0.375rem; }
+      .stats-row { grid-template-columns: repeat(2, 1fr); }
+      .card-actions { padding: 0.25rem 0.75rem; }
+      .btn { font-size: 0.65rem; padding: 3px 7px; }
+      .modal { width: 100%; border-radius: 0; max-height: 95vh; }
+      .modal-header { padding: 0.5rem 0.75rem; }
+      .config-tabs { padding: 0 0.75rem; }
+      #config-tab-content { padding: 0.25rem 0.75rem 0.75rem; }
+      .process-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+      .group-actions { display: none; }
+    }
   </style>
 </head>
 <body>
