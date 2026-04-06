@@ -1119,12 +1119,12 @@ function renderPage(processes) {
     .logo strong { color: var(--accent); font-weight: 700; }
 
     .proc-count {
-      font-size: 0.65rem;
-      color: var(--text-faint);
+      font-size: 0.7rem;
+      color: var(--text-muted);
       padding: 2px 8px;
       background: var(--bg-tertiary);
       border: 1px solid var(--border);
-      border-radius: 10px;
+      border-radius: var(--radius-sm);
       line-height: 1.3;
       white-space: nowrap;
     }
@@ -1132,7 +1132,7 @@ function renderPage(processes) {
     .header-right {
       display: flex;
       align-items: center;
-      gap: 0.25rem;
+      gap: 0.4rem;
       flex-wrap: wrap;
       min-width: 0;
       margin-left: auto;
@@ -1140,15 +1140,23 @@ function renderPage(processes) {
 
     /* ── Navbar button groups ───────────────────────────────────────────── */
     .nav-group {
-      display: flex;
+      display: inline-flex;
       align-items: center;
       gap: 2px;
+      background: var(--bg-tertiary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 2px;
+    }
+    .nav-group .hdr-btn {
+      border-color: transparent;
+      padding: 4px 7px;
     }
     .nav-sep {
       width: 1px;
-      height: 18px;
+      height: 22px;
       background: var(--border);
-      margin: 0 0.35rem;
+      margin: 0 0.3rem;
       flex-shrink: 0;
     }
 
@@ -1166,8 +1174,8 @@ function renderPage(processes) {
       color: var(--text-faint);
       cursor: pointer;
       font-family: var(--font-mono);
-      font-size: 0.68rem;
-      padding: 3px 8px;
+      font-size: 0.75rem;
+      padding: 5px 10px;
       transition: background 0.15s, color 0.15s;
       white-space: nowrap;
       line-height: 1.3;
@@ -1189,9 +1197,9 @@ function renderPage(processes) {
       display: flex;
       align-items: center;
       gap: 5px;
-      font-size: 0.72rem;
+      font-size: 0.68rem;
       color: var(--text-faint);
-      padding: 0 0.15rem;
+      padding: 0 0.1rem;
     }
 
     .pulse {
@@ -1212,16 +1220,18 @@ function renderPage(processes) {
       color: var(--text-muted);
       cursor: pointer;
       font-family: var(--font-mono);
-      font-size: 0.72rem;
-      padding: 4px 6px;
+      font-size: 0.78rem;
+      padding: 5px 8px;
       transition: border-color 0.15s, color 0.15s, background 0.15s;
       white-space: nowrap;
       text-decoration: none;
-      line-height: 1.2;
+      line-height: 1.3;
     }
     .hdr-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
     .hdr-btn.primary { border-color: var(--border); }
     .hdr-btn.primary:hover { border-color: var(--accent); color: var(--accent); }
+    .nav-group .hdr-btn.primary { border-color: transparent; }
+    .nav-group .hdr-btn.primary:hover { background: var(--bg-hover); border-color: transparent; color: var(--accent); }
     .hdr-btn.save:hover { color: var(--green); }
     .hdr-btn.help:hover { color: var(--text-primary); }
 
@@ -1690,10 +1700,10 @@ function renderPage(processes) {
       background: var(--bg-tertiary);
       border: 1px solid var(--border);
       border-radius: 3px;
-      padding: 0 4px;
+      padding: 1px 5px;
       font-size: 0.65rem;
-      color: var(--text-faint);
-      margin-left: 4px;
+      color: var(--text-muted);
+      margin-left: 5px;
       vertical-align: middle;
       font-family: var(--font-mono);
     }
@@ -1825,25 +1835,25 @@ function renderPage(processes) {
     }
     .search-icon {
       position: absolute;
-      left: 7px;
-      font-size: 0.65rem;
+      left: 8px;
+      font-size: 0.7rem;
       color: var(--text-faint);
       pointer-events: none;
       line-height: 1;
     }
     .search-input {
       font-family: var(--font-mono);
-      font-size: 0.72rem;
+      font-size: 0.75rem;
       background: var(--bg-tertiary);
       border: 1px solid var(--border);
       border-radius: var(--radius-sm);
       color: var(--text-primary);
-      padding: 5px 10px 5px 22px;
-      width: 140px;
+      padding: 5px 10px 5px 24px;
+      width: 150px;
       transition: border-color 0.15s, width 0.25s ease, background 0.15s;
       min-width: 80px;
     }
-    .search-input:focus { outline: none; border-color: var(--accent); width: 200px; background: var(--bg-secondary); }
+    .search-input:focus { outline: none; border-color: var(--accent); width: 220px; background: var(--bg-secondary); }
     .search-input::placeholder { color: var(--text-faint); }
 
     /* ── Process table view ─────────────────────────────────────────────── */
@@ -3358,8 +3368,10 @@ function renderPage(processes) {
       }
 
       _btnContent(a) {
-        const kbd = a.key ? ' <kbd class="hdr-kbd">' + this._displayKey(a.key) + '</kbd>' : '';
-        return (a.icon || '') + ' ' + a.label + kbd;
+        var parts = [];
+        if (a.icon) parts.push(a.icon);
+        if (a.label) parts.push(a.label);
+        return parts.join(' ');
       }
 
       _displayKey(key) {
@@ -3476,21 +3488,21 @@ function renderPage(processes) {
         { id: 'save-btn',  label: 'Save',  icon: '💾', key: 's', noMod: true, hint: 'save',
           title: 'pm2 save — writes process list to dump (s)',
           className: 'primary save', group: 'actions', action: () => saveList() },
-        { label: '⟳', icon: '',
+        { label: '', icon: '⟳',
           title: 'pm2 resurrect — restore from last save',
           group: 'actions', action: () => doResurrect() },
-        { id: 'scan-btn', label: '🔍', icon: '', key: 'd', noMod: true, hint: 'discover',
+        { id: 'scan-btn', label: 'Scan', icon: '🔍', key: 'd', noMod: true, hint: 'discover',
           title: 'Scan for new projects (d)',
           group: 'actions', action: () => openScanModal() },
         { type: 'nav-sep' },
         // ── Settings ──
-        { id: 'config-btn', label: '⚙', icon: '', key: 'c', noMod: true, hint: 'config',
+        { id: 'config-btn', label: '', icon: '⚙', key: 'c', noMod: true, hint: 'config',
           title: 'Settings: groups, URLs, merges (c)',
           group: 'settings', action: () => openConfigModal() },
-        { id: 'help-btn', label: '?', icon: '', key: '?', hint: 'help',
+        { id: 'help-btn', label: '', icon: '?', key: '?', hint: 'help',
           title: 'Quick reference (?)',
           className: 'help', group: 'settings', action: () => openHelp() },
-        { id: 'theme-btn', label: '🎨', icon: '', key: 't', noMod: true, hint: 'theme',
+        { id: 'theme-btn', label: '', icon: '🎨', key: 't', noMod: true, hint: 'theme',
           title: 'Color theme (t)',
           alwaysActive: true, group: 'settings', action: () => toggleThemePanel() },
         { type: 'nav-sep' },
