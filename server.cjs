@@ -1096,7 +1096,7 @@ function renderPage(processes) {
     header {
       display: flex;
       align-items: center;
-      gap: 0.75rem;
+      gap: 0.625rem;
       margin-bottom: 1.25rem;
       padding-bottom: 0.75rem;
       border-bottom: 1px solid var(--border);
@@ -1132,18 +1132,66 @@ function renderPage(processes) {
     .header-right {
       display: flex;
       align-items: center;
-      gap: 0.3rem;
+      gap: 0.25rem;
       flex-wrap: wrap;
       min-width: 0;
       margin-left: auto;
+    }
+
+    /* ── Navbar button groups ───────────────────────────────────────────── */
+    .nav-group {
+      display: flex;
+      align-items: center;
+      gap: 2px;
+    }
+    .nav-sep {
+      width: 1px;
+      height: 18px;
+      background: var(--border);
+      margin: 0 0.35rem;
+      flex-shrink: 0;
+    }
+
+    /* ── Segmented toggle ──────────────────────────────────────────────── */
+    .seg-toggle {
+      display: inline-flex;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+    .seg-toggle .seg-opt {
+      background: none;
+      border: none;
+      color: var(--text-faint);
+      cursor: pointer;
+      font-family: var(--font-mono);
+      font-size: 0.68rem;
+      padding: 3px 8px;
+      transition: background 0.15s, color 0.15s;
+      white-space: nowrap;
+      line-height: 1.3;
+    }
+    .seg-toggle .seg-opt:not(:last-child) {
+      border-right: 1px solid var(--border);
+    }
+    .seg-toggle .seg-opt:hover {
+      color: var(--text-secondary);
+      background: var(--bg-hover);
+    }
+    .seg-toggle .seg-opt.active {
+      background: var(--accent-bg);
+      color: var(--accent);
+      font-weight: 600;
     }
 
     .live-indicator {
       display: flex;
       align-items: center;
       gap: 5px;
-      font-size: 0.78rem;
+      font-size: 0.72rem;
       color: var(--text-faint);
+      padding: 0 0.15rem;
     }
 
     .pulse {
@@ -1159,20 +1207,23 @@ function renderPage(processes) {
 
     .hdr-btn {
       background: none;
-      border: 1px solid var(--border);
+      border: 1px solid transparent;
       border-radius: var(--radius-sm);
       color: var(--text-muted);
       cursor: pointer;
       font-family: var(--font-mono);
-      font-size: 0.75rem;
-      padding: 3px 7px;
+      font-size: 0.72rem;
+      padding: 4px 6px;
       transition: border-color 0.15s, color 0.15s, background 0.15s;
       white-space: nowrap;
       text-decoration: none;
+      line-height: 1.2;
     }
-    .hdr-btn:hover { border-color: var(--accent); color: var(--accent); }
-    .hdr-btn.save:hover { border-color: var(--green); color: var(--green); }
-    .hdr-btn.help:hover { border-color: var(--text-secondary); color: var(--text-primary); }
+    .hdr-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+    .hdr-btn.primary { border-color: var(--border); }
+    .hdr-btn.primary:hover { border-color: var(--accent); color: var(--accent); }
+    .hdr-btn.save:hover { color: var(--green); }
+    .hdr-btn.help:hover { color: var(--text-primary); }
 
     /* ── Grid ───────────────────────────────────────────────────────────── */
     .grid {
@@ -1691,6 +1742,33 @@ function renderPage(processes) {
       from { opacity: 0; transform: translateX(8px); }
       to   { opacity: 1; transform: translateX(0); }
     }
+    .toast.toast-exit {
+      animation: toast-out 0.25s ease forwards;
+    }
+    @keyframes toast-out {
+      from { opacity: 1; transform: translateX(0); }
+      to   { opacity: 0; transform: translateX(12px) scale(0.95); }
+    }
+
+    /* ── View transitions ─────────────────────────────────────────────── */
+    #grid, #table-wrap {
+      transition: opacity 0.2s ease;
+    }
+    .view-fade-out { opacity: 0 !important; }
+    .view-fade-in { animation: view-appear 0.2s ease; }
+    @keyframes view-appear {
+      from { opacity: 0; }
+      to   { opacity: 1; }
+    }
+
+    /* ── Reorder animation ────────────────────────────────────────────── */
+    .reorder-flash {
+      animation: reorder-highlight 0.4s ease;
+    }
+    @keyframes reorder-highlight {
+      0%   { background: var(--accent-bg); }
+      100% { background: transparent; }
+    }
 
     /* ── Hint bar ───────────────────────────────────────────────────────── */
     .hint-bar {
@@ -1739,6 +1817,20 @@ function renderPage(processes) {
     }
 
     /* ── Search input ───────────────────────────────────────────────────── */
+    .search-wrap {
+      position: relative;
+      display: flex;
+      align-items: center;
+      flex-shrink: 1;
+    }
+    .search-icon {
+      position: absolute;
+      left: 7px;
+      font-size: 0.65rem;
+      color: var(--text-faint);
+      pointer-events: none;
+      line-height: 1;
+    }
     .search-input {
       font-family: var(--font-mono);
       font-size: 0.72rem;
@@ -1746,13 +1838,12 @@ function renderPage(processes) {
       border: 1px solid var(--border);
       border-radius: var(--radius-sm);
       color: var(--text-primary);
-      padding: 4px 10px;
-      width: 120px;
-      transition: border-color 0.15s, width 0.2s;
-      flex-shrink: 1;
+      padding: 5px 10px 5px 22px;
+      width: 140px;
+      transition: border-color 0.15s, width 0.25s ease, background 0.15s;
       min-width: 80px;
     }
-    .search-input:focus { outline: none; border-color: var(--accent); width: 180px; }
+    .search-input:focus { outline: none; border-color: var(--accent); width: 200px; background: var(--bg-secondary); }
     .search-input::placeholder { color: var(--text-faint); }
 
     /* ── Process table view ─────────────────────────────────────────────── */
@@ -1956,14 +2047,20 @@ function renderPage(processes) {
     .group-collapse-btn {
       background: none; border: none; color: var(--text-faint);
       cursor: pointer; font-size: 0.75rem; padding: 0 4px;
+      transition: transform 0.2s ease;
     }
     .group-actions { margin-left: auto; }
-    .group-section.collapsed .group-grid { display: none; }
+    .group-section.collapsed .group-grid {
+      max-height: 0; opacity: 0; overflow: hidden;
+      margin-top: 0; padding-top: 0;
+    }
     .group-section.collapsed .group-collapse-btn { transform: none; }
     .group-section .group-grid {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
       gap: 1rem;
+      max-height: 4000px; opacity: 1; overflow: visible;
+      transition: max-height 0.35s ease, opacity 0.25s ease, margin-top 0.25s ease;
     }
 
     /* ── Merged cards ──────────────────────────────────────────────────── */
@@ -2141,8 +2238,10 @@ function renderPage(processes) {
     @media (max-width: 768px) {
       body { padding: 0.5rem; }
       header { flex-wrap: wrap; gap: 0.5rem; }
-      .header-right { flex-wrap: wrap; gap: 4px; }
+      .header-right { flex-wrap: wrap; gap: 3px; }
       .hdr-btn .hdr-kbd { display: none; }
+      .nav-sep { display: none; }
+      .seg-toggle .seg-opt { padding: 3px 6px; font-size: 0.62rem; }
       .search-input { width: 100px; min-width: 60px; }
       .search-input:focus { width: 140px; }
       .stats-bar { flex-wrap: wrap; gap: 0.5rem 1rem; padding: 0.5rem 1rem; margin: -1rem -0.5rem 1rem; }
@@ -2176,12 +2275,15 @@ function renderPage(processes) {
 <body>
   <header>
     <div class="header-left">
-      <div class="logo"><strong>pm2</strong> manager</div>
+      <div class="logo"><strong>pm2</strong> manage</div>
       <span class="proc-count" id="proc-count">${count} process${count !== 1 ? 'es' : ''}</span>
     </div>
-    <input class="search-input" id="search-input" type="text" placeholder="filter…"
-      oninput="applySearch(this.value)"
-      title="Filter processes by name. Press / to focus, Esc to clear.">
+    <div class="search-wrap">
+      <span class="search-icon">⌕</span>
+      <input class="search-input" id="search-input" type="text" placeholder="filter… (/)"
+        oninput="applySearch(this.value)"
+        title="Filter processes by name. Press / to focus, Esc to clear.">
+    </div>
     <div class="header-right" id="navbar-buttons"></div>
   </header>
 
@@ -2817,16 +2919,35 @@ function renderPage(processes) {
       applyView();
     }
 
-    function applyView() {
+    function applyView(skipAnim) {
       const isTable = currentView === 'table';
-      document.getElementById('grid').style.display      = isTable ? 'none' : '';
-      document.getElementById('table-wrap').style.display = isTable ? '' : 'none';
-      if (navbar) navbar.updateButton('view-btn', { label: isTable ? 'Table' : 'Cards', icon: isTable ? '⊟' : '⊞' });
+      var gridEl = document.getElementById('grid');
+      var tableEl = document.getElementById('table-wrap');
+      if (navbar) navbar.updateSegToggle('view-seg', isTable ? 'table' : 'cards');
       if (isTable && lastProcesses.length) {
         renderTable(lastProcesses);
         if (lastMetrics) drawSparklines(lastMetrics);
         if (lastHealthMetrics) drawHealthSparklines(lastHealthMetrics);
       }
+      if (skipAnim) {
+        gridEl.style.display = isTable ? 'none' : '';
+        tableEl.style.display = isTable ? '' : 'none';
+        return;
+      }
+      // Crossfade: fade out old, swap, fade in new
+      var outEl = isTable ? gridEl : tableEl;
+      var inEl = isTable ? tableEl : gridEl;
+      outEl.classList.add('view-fade-out');
+      setTimeout(function() {
+        outEl.style.display = 'none';
+        outEl.classList.remove('view-fade-out');
+        inEl.style.display = '';
+        inEl.classList.add('view-fade-in');
+        inEl.addEventListener('animationend', function handler() {
+          inEl.classList.remove('view-fade-in');
+          inEl.removeEventListener('animationend', handler);
+        });
+      }, 180);
     }
 
     function renderTable(procs) {
@@ -2955,8 +3076,8 @@ function renderPage(processes) {
       } catch { toast('Request failed', 'err'); }
     }
 
-    // Initialise view
-    applyView();
+    // Initialise view (skip animation on page load)
+    applyView(true);
 
     showSkeletons(${Math.max(count, 3)});
     refresh();
@@ -3167,32 +3288,71 @@ function renderPage(processes) {
 
       _render() {
         this.container.innerHTML = '';
+        var currentGroup = null;
         for (const a of this.actions) {
           if (a.type === 'hidden') continue;
+          if (a.type === 'nav-sep') {
+            currentGroup = null;
+            var sep = document.createElement('span');
+            sep.className = 'nav-sep';
+            this.container.appendChild(sep);
+            continue;
+          }
           if (a.type === 'separator') {
+            currentGroup = null;
             const sep = document.createElement('span');
             sep.className = a.className || 'live-indicator';
             sep.innerHTML = a.html || '';
             this.container.appendChild(sep);
             continue;
           }
+          if (a.type === 'seg-toggle') {
+            currentGroup = null;
+            var toggle = document.createElement('span');
+            toggle.className = 'seg-toggle';
+            if (a.id) toggle.id = a.id;
+            toggle.title = a.title || '';
+            for (var oi = 0; oi < a.options.length; oi++) {
+              var opt = a.options[oi];
+              var ob = document.createElement('button');
+              ob.className = 'seg-opt' + (opt.active ? ' active' : '');
+              ob.textContent = opt.label;
+              ob.title = opt.title || '';
+              ob.dataset.value = opt.value;
+              ob.addEventListener('click', (function(action) { return function() { action(); }; })(opt.action));
+              toggle.appendChild(ob);
+            }
+            this.container.appendChild(toggle);
+            this._btnMap[a.id] = toggle;
+            continue;
+          }
           if (a.type === 'link') {
+            currentGroup = null;
             const link = document.createElement('a');
             link.className = 'hdr-btn' + (a.className ? ' ' + a.className : '');
             link.href = a.href;
             link.target = '_blank';
             link.title = a.title || '';
-            link.innerHTML = a.icon + ' ' + a.label;
+            link.innerHTML = a.icon + (a.label ? ' ' + a.label : '');
             this.container.appendChild(link);
             continue;
           }
+          // Group buttons inside nav-group containers
+          if (a.group && a.group !== (currentGroup || '')) {
+            currentGroup = a.group;
+            var grp = document.createElement('span');
+            grp.className = 'nav-group';
+            grp.dataset.group = a.group;
+            this.container.appendChild(grp);
+          }
+          var parent = a.group ? this.container.querySelector('.nav-group[data-group="' + a.group + '"]') : this.container;
           const btn = document.createElement('button');
           btn.className = 'hdr-btn' + (a.className ? ' ' + a.className : '');
           if (a.id) btn.id = a.id;
           btn.title = a.title || '';
           btn.innerHTML = this._btnContent(a);
           btn.addEventListener('click', a.action);
-          this.container.appendChild(btn);
+          parent.appendChild(btn);
           this._btnMap[a.id || a.key] = btn;
         }
       }
@@ -3267,12 +3427,26 @@ function renderPage(processes) {
         btn.innerHTML = this._btnContent(a);
       }
 
+      /** Update segmented toggle active state by value */
+      updateSegToggle(id, activeValue) {
+        var toggle = this._btnMap[id];
+        if (!toggle) return;
+        toggle.querySelectorAll('.seg-opt').forEach(function(opt) {
+          opt.classList.toggle('active', opt.dataset.value === activeValue);
+        });
+      }
+
       destroy() {
         document.removeEventListener('keydown', this._keydownHandler);
       }
     }
 
+    // ── Group view state (must be before navbar config) ───────────────────
+    let groupView = localStorage.getItem('pm2-group-view') || 'flat';
+
     // ── Navbar action config ────────────────────────────────────────────────
+    var _isTable = currentView === 'table';
+    var _isGrouped = groupView === 'grouped';
     navbar = new NavbarShortcuts({
       containerId: 'navbar-buttons',
       hintBarId: 'hint-bar',
@@ -3284,43 +3458,61 @@ function renderPage(processes) {
         else { si.blur(); }
       },
       actions: [
-        { id: 'view-btn',  label: 'Cards', icon: '⊞', key: 'v', noMod: true, hint: 'card/table',
-          title: 'Toggle between card grid and table view (v)',
-          action: () => toggleView() },
-        { id: 'group-btn', label: 'Flat',  icon: '📋', key: 'g', noMod: true, hint: 'group',
-          title: 'Toggle grouped/flat view (g)',
-          action: () => toggleGroupView() },
+        // ── View toggles (segmented controls) ──
+        { id: 'view-seg', type: 'seg-toggle', title: 'Switch view (v)', options: [
+          { label: '⊞ Cards', value: 'cards', active: !_isTable,  title: 'Card grid view',
+            action: function() { if (currentView !== 'cards') toggleView(); } },
+          { label: '⊟ Table', value: 'table', active: _isTable,   title: 'Table view',
+            action: function() { if (currentView !== 'table') toggleView(); } },
+        ]},
+        { id: 'group-seg', type: 'seg-toggle', title: 'Layout mode (g)', options: [
+          { label: '☰ Flat', value: 'flat', active: !_isGrouped,  title: 'Flat list',
+            action: function() { if (groupView !== 'flat') toggleGroupView(); } },
+          { label: '▤ Grouped', value: 'grouped', active: _isGrouped, title: 'Group by category',
+            action: function() { if (groupView !== 'grouped') toggleGroupView(); } },
+        ]},
+        { type: 'nav-sep' },
+        // ── Primary actions ──
         { id: 'save-btn',  label: 'Save',  icon: '💾', key: 's', noMod: true, hint: 'save',
-          title: 'pm2 save — writes current process list to ~/.pm2/dump.pm2 (s)',
-          className: 'save', action: () => saveList() },
-        { label: 'Resurrect', icon: '⟳',
-          title: 'pm2 resurrect — restores all processes from the last pm2 save dump',
-          action: () => doResurrect() },
-        { id: 'scan-btn', label: 'Scan', icon: '🔍', key: 'd', noMod: true, hint: 'discover',
-          title: 'Scan for new projects to add (d)',
-          action: () => openScanModal() },
-        { id: 'config-btn', label: 'Config', icon: '⚙', key: 'c', noMod: true, hint: 'config',
-          title: 'Settings: groups, static URLs, merges (c)',
-          action: () => openConfigModal() },
-        { id: 'help-btn', label: 'Help', icon: '?', key: '?', hint: 'help',
-          title: 'Quick reference guide (?)',
-          className: 'help', action: () => openHelp() },
-        // Live indicator (separator)
+          title: 'pm2 save — writes process list to dump (s)',
+          className: 'primary save', group: 'actions', action: () => saveList() },
+        { label: '⟳', icon: '',
+          title: 'pm2 resurrect — restore from last save',
+          group: 'actions', action: () => doResurrect() },
+        { id: 'scan-btn', label: '🔍', icon: '', key: 'd', noMod: true, hint: 'discover',
+          title: 'Scan for new projects (d)',
+          group: 'actions', action: () => openScanModal() },
+        { type: 'nav-sep' },
+        // ── Settings ──
+        { id: 'config-btn', label: '⚙', icon: '', key: 'c', noMod: true, hint: 'config',
+          title: 'Settings: groups, URLs, merges (c)',
+          group: 'settings', action: () => openConfigModal() },
+        { id: 'help-btn', label: '?', icon: '', key: '?', hint: 'help',
+          title: 'Quick reference (?)',
+          className: 'help', group: 'settings', action: () => openHelp() },
+        { id: 'theme-btn', label: '🎨', icon: '', key: 't', noMod: true, hint: 'theme',
+          title: 'Color theme (t)',
+          alwaysActive: true, group: 'settings', action: () => toggleThemePanel() },
+        { type: 'nav-sep' },
+        // ── Status ──
         { type: 'separator', className: 'live-indicator',
           html: '<span id="last-update">—</span><span class="pulse" title="Auto-refreshing every 5s"></span>' },
-        { id: 'theme-btn', label: 'Theme', icon: '🎨', key: 't', noMod: true, hint: 'theme',
-          title: 'Pick a color theme (t → 1-9 or arrows)',
-          alwaysActive: true, action: () => toggleThemePanel() },
-        // Hidden shortcut-only actions (no button, just keyboard binding)
+        // ── Link ──
+        { type: 'link', label: '', icon: '{}', href: '/api/state',
+          title: 'View dashboard state as JSON' },
+        // ── Hidden keyboard-only shortcuts ──
+        { key: 'v', noMod: true, hint: 'card/table', label: '', icon: '',
+          action: function() { toggleView(); },
+          type: 'hidden' },
+        { key: 'g', noMod: true, hint: 'group', label: '', icon: '',
+          action: function() { toggleGroupView(); },
+          type: 'hidden' },
         { key: 'r', noMod: true, hint: 'refresh', label: '', icon: '', action: () => refresh(),
           type: 'hidden' },
         { key: '/', hint: 'search', label: '', icon: '', preventDefault: true,
           action: () => document.getElementById('search-input').focus(),
           type: 'hidden' },
-        // State link
-        { type: 'link', label: 'State', icon: '{}', href: '/api/state',
-          title: 'View full dashboard state as raw JSON' },
-      ].filter(a => a.type !== 'hidden' || a.key), // keep hidden actions for keyboard
+      ].filter(a => a.type !== 'hidden' || a.key),
     });
 
     // ── Toast ──────────────────────────────────────────────────────────────
@@ -3329,27 +3521,47 @@ function renderPage(processes) {
       el.className = 'toast ' + type;
       el.textContent = msg;
       document.getElementById('toasts').appendChild(el);
-      setTimeout(() => el.remove(), type === 'err' ? 5000 : 3500);
+      var dur = type === 'err' ? 5000 : 3500;
+      setTimeout(function() {
+        el.classList.add('toast-exit');
+        el.addEventListener('animationend', function() { el.remove(); });
+      }, dur);
       return el;
     }
 
     // Async toast: shows loading message, returns object with .done(msg) and .error(msg)
     function toastAsync(loadingMsg) {
       const el = toast(loadingMsg + '…', 'loading');
+      function exitAfter(ms) {
+        clearTimeout(el._t);
+        el._t = setTimeout(function() {
+          el.classList.add('toast-exit');
+          el.addEventListener('animationend', function() { el.remove(); });
+        }, ms);
+      }
       return {
-        done: function(msg) { el.textContent = msg; el.className = 'toast ok'; clearTimeout(el._t); el._t = setTimeout(function() { el.remove(); }, 3500); },
-        error: function(msg) { el.textContent = msg; el.className = 'toast err'; clearTimeout(el._t); el._t = setTimeout(function() { el.remove(); }, 5000); },
+        done: function(msg) { el.textContent = msg; el.className = 'toast ok'; exitAfter(3500); },
+        error: function(msg) { el.textContent = msg; el.className = 'toast err'; exitAfter(5000); },
       };
     }
 
     // ── Group view toggle ─────────────────────────────────────────────────
-    let groupView = localStorage.getItem('pm2-group-view') || 'flat';
-
     function toggleGroupView() {
       groupView = groupView === 'flat' ? 'grouped' : 'flat';
       localStorage.setItem('pm2-group-view', groupView);
-      if (navbar) navbar.updateButton('group-btn', { label: groupView === 'grouped' ? 'Grouped' : 'Flat', icon: groupView === 'grouped' ? '📂' : '📋' });
-      refresh();
+      if (navbar) navbar.updateSegToggle('group-seg', groupView);
+      // Fade transition on layout change
+      var gridEl = document.getElementById('grid');
+      gridEl.classList.add('view-fade-out');
+      setTimeout(function() {
+        refresh();
+        gridEl.classList.remove('view-fade-out');
+        gridEl.classList.add('view-fade-in');
+        gridEl.addEventListener('animationend', function handler() {
+          gridEl.classList.remove('view-fade-in');
+          gridEl.removeEventListener('animationend', handler);
+        });
+      }, 150);
     }
 
     function toggleGroupCollapse(gid) {
@@ -3407,7 +3619,7 @@ function renderPage(processes) {
     }
 
     // Init group button text from navbar config
-    if (navbar) navbar.updateButton('group-btn', { label: groupView === 'grouped' ? 'Grouped' : 'Flat', icon: groupView === 'grouped' ? '📂' : '📋' });
+    if (navbar) navbar.updateSegToggle('group-seg', groupView);
 
     // ── Color picker ──────────────────────────────────────────────────────
     let activeColorPicker = null;
@@ -3571,7 +3783,7 @@ function renderPage(processes) {
           clearDragIndicators();
           const target = card.dataset.name;
           if (!dragSourceName || dragSourceName === target) return;
-          // Instant DOM reorder (optimistic update)
+          // Instant DOM reorder (optimistic update) with flash animation
           const sourceCard = document.querySelector('.card[data-name="' + CSS.escape(dragSourceName) + '"]');
           if (sourceCard && card.parentElement) {
             sourceCard.classList.remove('drag-source');
@@ -3580,6 +3792,8 @@ function renderPage(processes) {
             } else {
               card.parentElement.insertBefore(sourceCard, card.nextSibling);
             }
+            sourceCard.classList.add('reorder-flash');
+            sourceCard.addEventListener('animationend', function handler() { sourceCard.classList.remove('reorder-flash'); sourceCard.removeEventListener('animationend', handler); });
           }
           // Build new order from current DOM state and persist
           const allCards = [...document.querySelectorAll('.card[data-name]')].map(function(c) { return c.dataset.name; });
@@ -3637,7 +3851,7 @@ function renderPage(processes) {
         });
         var rect = targetSection.getBoundingClientRect();
         var pos = (e.clientY - rect.top) < rect.height / 2 ? 'top' : 'bottom';
-        // Instant DOM reorder
+        // Instant DOM reorder with flash
         var sourceSection = grid.querySelector('.group-section[data-group="' + CSS.escape(_dragGroupId) + '"]');
         if (sourceSection) {
           if (pos === 'top') {
@@ -3645,6 +3859,8 @@ function renderPage(processes) {
           } else {
             targetSection.parentElement.insertBefore(sourceSection, targetSection.nextSibling);
           }
+          sourceSection.classList.add('reorder-flash');
+          sourceSection.addEventListener('animationend', function handler() { sourceSection.classList.remove('reorder-flash'); sourceSection.removeEventListener('animationend', handler); });
         }
         // Persist group order
         var sections = grid.querySelectorAll('.group-section[data-group]');
@@ -3703,7 +3919,7 @@ function renderPage(processes) {
         clearDragIndicators();
         var target = row.dataset.name;
         if (dragSourceName === target) return;
-        // Instant DOM reorder
+        // Instant DOM reorder with flash
         var sourceRow = tbody.querySelector('tr[data-name="' + CSS.escape(dragSourceName) + '"]');
         if (sourceRow) {
           sourceRow.classList.remove('drag-source');
@@ -3712,6 +3928,8 @@ function renderPage(processes) {
           } else {
             row.parentElement.insertBefore(sourceRow, row.nextSibling);
           }
+          sourceRow.classList.add('reorder-flash');
+          sourceRow.addEventListener('animationend', function handler() { sourceRow.classList.remove('reorder-flash'); sourceRow.removeEventListener('animationend', handler); });
         }
         // Persist order from table rows
         var allRows = tbody.querySelectorAll('tr[data-name]');
