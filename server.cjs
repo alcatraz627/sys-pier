@@ -743,6 +743,7 @@ function renderCardsGrouped(processes) {
     html += `<div class="group-section ${collapsed}" data-group="${escHtml(gid)}"
       ondragover="onGroupDragOver(event)" ondrop="onGroupDrop(event,'${escHtml(gid)}')">
       <div class="group-header" onclick="toggleGroupCollapse('${escHtml(gid)}')">
+        <span class="group-drag-handle drag-handle" draggable="true" ondragstart="event.stopPropagation();onGroupSectionDragStart(event,'${escHtml(gid)}')" title="Drag to reorder group" style="opacity:0.3;cursor:grab;margin-right:2px">⠿</span>
         <span class="group-emoji" onclick="event.stopPropagation();openEmojiPicker(this,'${escHtml(gid)}')" title="Click to change icon" style="cursor:pointer">${ginfo.emoji || '📦'}</span>
         <span class="group-name" ondblclick="event.stopPropagation();startGroupNameEdit('${escHtml(gid)}',this)" title="Double-click to rename">${escHtml(ginfo.name || gid)}</span>
         <span class="group-count">${gitems.length}</span>
@@ -1893,7 +1894,13 @@ function renderPage(processes) {
     }
 
     /* ── Group sections ────────────────────────────────────────────────── */
-    .group-section { margin-bottom: 1.5rem; }
+    .group-section { margin-bottom: 1.5rem; transition: opacity 0.2s; }
+    .group-section.drag-source { opacity: 0.35; }
+    .group-section.drag-over-top { box-shadow: 0 -3px 0 0 var(--accent); border-radius: var(--radius); }
+    .group-section.drag-over-bottom { box-shadow: 0 3px 0 0 var(--accent); border-radius: var(--radius); }
+    .group-header .group-drag-handle { opacity: 0; transition: opacity 0.15s; }
+    .group-header:hover .group-drag-handle { opacity: 0.5; }
+    .group-drag-handle:hover { opacity: 1 !important; }
     .group-header {
       display: flex; align-items: center; gap: 8px;
       padding: 6px 0; margin-bottom: 0.75rem;
@@ -3452,6 +3459,82 @@ function renderPage(processes) {
         });
       });
     }
+
+    // ── Group section reorder ──────────────────────────────────────────
+    var _dragGroupId = null;
+
+    function onGroupSectionDragStart(e, gid) {
+      _dragGroupId = gid;
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', 'group:' + gid);
+      var section = e.target.closest('.group-section');
+      if (section) section.classList.add('drag-source');
+    }
+
+    // Attach via delegation on #grid
+    (function() {
+      var grid = document.getElementById('grid');
+      if (!grid) return;
+      grid.addEventListener('dragover', function(e) {
+        if (!_dragGroupId) return;
+        var section = e.target.closest('.group-section');
+        if (!section || section.dataset.group === _dragGroupId) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+        document.querySelectorAll('.group-section.drag-over-top,.group-section.drag-over-bottom').forEach(function(el) {
+          el.classList.remove('drag-over-top', 'drag-over-bottom');
+        });
+        var rect = section.getBoundingClientRect();
+        var pos = (e.clientY - rect.top) < rect.height / 2 ? 'top' : 'bottom';
+        section.classList.add(pos === 'top' ? 'drag-over-top' : 'drag-over-bottom');
+      });
+      grid.addEventListener('drop', async function(e) {
+        if (!_dragGroupId) return;
+        var targetSection = e.target.closest('.group-section');
+        if (!targetSection || targetSection.dataset.group === _dragGroupId) return;
+        e.preventDefault();
+        document.querySelectorAll('.group-section.drag-over-top,.group-section.drag-over-bottom,.group-section.drag-source').forEach(function(el) {
+          el.classList.remove('drag-over-top', 'drag-over-bottom', 'drag-source');
+        });
+        var rect = targetSection.getBoundingClientRect();
+        var pos = (e.clientY - rect.top) < rect.height / 2 ? 'top' : 'bottom';
+        // Instant DOM reorder
+        var sourceSection = grid.querySelector('.group-section[data-group="' + CSS.escape(_dragGroupId) + '"]');
+        if (sourceSection) {
+          if (pos === 'top') {
+            targetSection.parentElement.insertBefore(sourceSection, targetSection);
+          } else {
+            targetSection.parentElement.insertBefore(sourceSection, targetSection.nextSibling);
+          }
+        }
+        // Persist group order
+        var sections = grid.querySelectorAll('.group-section[data-group]');
+        var order = 0;
+        var updates = [];
+        sections.forEach(function(s) {
+          var gid = s.dataset.group;
+          if (gid && gid !== '_ungrouped') {
+            updates.push(fetch('/api/groups/' + encodeURIComponent(gid), {
+              method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ order: order++ }),
+            }));
+          }
+        });
+        try {
+          await Promise.all(updates);
+          var res = await fetch('/api/config');
+          DASH_CONFIG = await res.json();
+          toast('Group order updated', 'ok');
+        } catch(e) { toast('Failed to reorder groups', 'err'); }
+        _dragGroupId = null;
+      });
+      grid.addEventListener('dragend', function() {
+        _dragGroupId = null;
+        document.querySelectorAll('.group-section.drag-over-top,.group-section.drag-over-bottom,.group-section.drag-source').forEach(function(el) {
+          el.classList.remove('drag-over-top', 'drag-over-bottom', 'drag-source');
+        });
+      });
+    })();
 
     // ── Table row drag-drop (event delegation on tbody) ───────────────
     (function() {
