@@ -2703,17 +2703,51 @@ function renderPage(processes) {
           + '</tr>';
       }
 
+      function renderStaticRow(slug, u) {
+        const key = 'static:' + slug;
+        const visible = !q || slug.toLowerCase().includes(q) || (u.title || '').toLowerCase().includes(q) || (u.url || '').toLowerCase().includes(q);
+        const grp = u.group ? groups[u.group] : null;
+        const groupLabel = grp ? '<span style="font-size:0.6rem;color:var(--text-faint)">' + (grp.emoji || '') + ' ' + (grp.name || u.group) + '</span>' : '';
+        const healthDot = '<span class="tbl-status-dot" id="tbl-health-' + slug + '" style="background:var(--text-faint)" title="Static URL"></span>';
+        return '<tr data-name="' + key + '" style="display:' + (visible ? '' : 'none') + '">'
+          + '<td class="tbl-drag"><span class="drag-handle" draggable="true" ondragstart="onDragStart(event,\\'' + key + '\\')" style="opacity:0.3;cursor:grab">⠿</span></td>'
+          + '<td>' + healthDot + '</td>'
+          + '<td class="tbl-name"><span style="color:var(--accent);font-size:0.7rem">🔗</span> ' + (u.title || slug) + '</td>'
+          + '<td style="color:var(--text-faint)">—</td>'
+          + '<td class="tbl-port"><a href="' + (u.url || '') + '" target="_blank" style="font-size:0.72rem">' + (u.url || '').replace(/^https?:\\/\\//, '') + '</a></td>'
+          + '<td>—</td><td>—</td><td>—</td><td>—</td>'
+          + '<td></td>'
+          + '<td>' + groupLabel + '</td>'
+          + '<td class="tbl-actions">'
+          + '<button class="btn btn-sm" onclick="checkHealth(\\'' + slug + '\\')" title="Health check">♡</button>'
+          + '<button class="btn btn-sm btn-danger" onclick="deleteStaticUrl(\\'' + slug + '\\')" title="Remove">✕</button>'
+          + '</td></tr>';
+      }
+
+      // Collect static URL entries
+      var staticUrls = DASH_CONFIG.staticUrls || {};
+      var staticEntries = Object.entries(staticUrls);
+
       if (grouped && Object.keys(groups).length > 0) {
-        // Partition procs into groups
+        // Partition procs + static URLs into groups
         const groupMap = {};
         const ungrouped = [];
         for (const p of procs) {
           const g = (entries[p.name] || {}).group;
           if (g && groups[g]) {
             if (!groupMap[g]) groupMap[g] = [];
-            groupMap[g].push(p);
+            groupMap[g].push({ type: 'proc', data: p });
           } else {
-            ungrouped.push(p);
+            ungrouped.push({ type: 'proc', data: p });
+          }
+        }
+        for (const [slug, u] of staticEntries) {
+          const g = u.group;
+          if (g && groups[g]) {
+            if (!groupMap[g]) groupMap[g] = [];
+            groupMap[g].push({ type: 'static', slug: slug, data: u });
+          } else {
+            ungrouped.push({ type: 'static', slug: slug, data: u });
           }
         }
         const groupOrder = Object.entries(groups).sort(function(a, b) { return (a[1].order ?? 999) - (b[1].order ?? 999); });
@@ -2722,15 +2756,21 @@ function renderPage(processes) {
           const items = groupMap[gid];
           if (!items || !items.length) continue;
           html += '<tr class="tbl-group-header"><td colspan="12"><span class="group-emoji">' + (ginfo.emoji || '📦') + '</span> <strong>' + (ginfo.name || gid) + '</strong> <span style="color:var(--text-faint);font-size:0.7rem">(' + items.length + ')</span>' + (ginfo.notes ? ' <span style="color:var(--text-faint);font-size:0.65rem">— ' + ginfo.notes + '</span>' : '') + '</td></tr>';
-          html += items.map(renderRow).join('');
+          html += items.map(function(item) {
+            return item.type === 'static' ? renderStaticRow(item.slug, item.data) : renderRow(item.data);
+          }).join('');
         }
         if (ungrouped.length) {
           html += '<tr class="tbl-group-header"><td colspan="12"><span class="group-emoji">📋</span> <strong>Ungrouped</strong> <span style="color:var(--text-faint);font-size:0.7rem">(' + ungrouped.length + ')</span></td></tr>';
-          html += ungrouped.map(renderRow).join('');
+          html += ungrouped.map(function(item) {
+            return item.type === 'static' ? renderStaticRow(item.slug, item.data) : renderRow(item.data);
+          }).join('');
         }
         tbody.innerHTML = html;
       } else {
-        tbody.innerHTML = procs.map(renderRow).join('');
+        var html = procs.map(renderRow).join('');
+        html += staticEntries.map(function(e) { return renderStaticRow(e[0], e[1]); }).join('');
+        tbody.innerHTML = html;
       }
     }
 
