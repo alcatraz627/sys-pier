@@ -4066,9 +4066,11 @@ function renderPage(processes) {
 
     // ── Merge/unmerge ─────────────────────────────────────────────────────
     async function doUnmerge(key) {
-      await fetch('/api/merges/' + encodeURIComponent(key), { method: 'DELETE' });
-      toast('Unmerged ' + key, 'ok');
-      refresh();
+      try {
+        await fetch('/api/merges/' + encodeURIComponent(key), { method: 'DELETE' });
+        toast('Unmerged ' + key, 'ok');
+        refresh();
+      } catch { toast('Failed to unmerge ' + key, 'err'); }
     }
 
     // ── Config export/import ────────────────────────────────────────────
@@ -4154,10 +4156,10 @@ function renderPage(processes) {
         const urlList = Object.entries(urls).map(([slug, u]) =>
           \`<li>
             <span>🔗</span>
-            <strong>\${slug}</strong>
-            <a href="\${u.url}" target="_blank" style="flex:1;font-size:0.62rem;color:var(--accent)">\${u.url}</a>
-            <span style="font-size:0.6rem;color:var(--text-faint)">\${u.group ? ((DASH_CONFIG.groups[u.group] || {}).name || u.group) : 'static'}</span>
-            <button class="btn btn-sm btn-danger" onclick="deleteStaticUrl('\${slug}')">✕</button>
+            <strong>\${_esc(slug)}</strong>
+            <a href="\${_esc(u.url)}" target="_blank" style="flex:1;font-size:0.62rem;color:var(--accent)">\${_esc(u.url)}</a>
+            <span style="font-size:0.6rem;color:var(--text-faint)">\${u.group ? _esc((DASH_CONFIG.groups[u.group] || {}).name || u.group) : 'static'}</span>
+            <button class="btn btn-sm btn-danger" onclick="deleteStaticUrl('\${_esc(slug)}')">✕</button>
           </li>\`
         ).join('') || '<li style="color:var(--text-faint)">No static URLs yet</li>';
         const groupOpts = Object.entries(DASH_CONFIG.groups || {}).map(([gid, g]) => \`<option value="\${gid}">\${g.name || gid}</option>\`).join('');
@@ -4175,9 +4177,9 @@ function renderPage(processes) {
         const mergeList = Object.entries(merges).map(([key, entries]) =>
           \`<li>
             <span>⚡</span>
-            <strong>\${key}</strong>
-            <span style="flex:1;font-size:0.62rem;color:var(--text-faint)">\${entries.join(' + ')}</span>
-            <button class="btn btn-sm btn-danger" onclick="doUnmerge('\${key}')">Unmerge</button>
+            <strong>\${_esc(key)}</strong>
+            <span style="flex:1;font-size:0.62rem;color:var(--text-faint)">\${_esc(entries.join(' + '))}</span>
+            <button class="btn btn-sm btn-danger" onclick="doUnmerge('\${_esc(key)}')">Unmerge</button>
           </li>\`
         ).join('');
         container.innerHTML = \`
@@ -4318,7 +4320,7 @@ function renderPage(processes) {
           body: JSON.stringify(updates),
         });
         const res = await fetch('/api/config');
-        DASH_CONFIG = await res.json();
+        if (res.ok) DASH_CONFIG = await res.json();
         t.done('Updated ' + gname + ' (' + what + ')');
         renderConfigTab('groups');
         refresh();
@@ -4332,26 +4334,30 @@ function renderPage(processes) {
       const emoji = (emojiHidden && emojiHidden.value) || (emojiBtn ? emojiBtn.textContent.trim() : '') || '📦';
       const notes = document.getElementById('new-group-notes').value.trim();
       if (!name) { toast('Group name required', 'err'); return; }
-      await fetch('/api/groups', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, emoji, notes }),
-      });
-      const res = await fetch('/api/config');
-      DASH_CONFIG = await res.json();
-      toast('Group "' + name + '" created', 'ok');
-      renderConfigTab('groups');
-      refresh();
+      try {
+        await fetch('/api/groups', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, emoji, notes }),
+        });
+        const res = await fetch('/api/config');
+        if (res.ok) DASH_CONFIG = await res.json();
+        toast('Group "' + name + '" created', 'ok');
+        renderConfigTab('groups');
+        refresh();
+      } catch { toast('Failed to create group', 'err'); }
     }
 
     async function deleteGroup(id) {
       const gname = (DASH_CONFIG.groups[id] || {}).name || id;
       if (!confirm('Delete group "' + gname + '"? Entries will become ungrouped.')) return;
-      await fetch('/api/groups/' + encodeURIComponent(id), { method: 'DELETE' });
-      const res = await fetch('/api/config');
-      DASH_CONFIG = await res.json();
-      toast('Group "' + gname + '" deleted', 'ok');
-      renderConfigTab('groups');
-      refresh();
+      try {
+        await fetch('/api/groups/' + encodeURIComponent(id), { method: 'DELETE' });
+        const res = await fetch('/api/config');
+        if (res.ok) DASH_CONFIG = await res.json();
+        toast('Group "' + gname + '" deleted', 'ok');
+        renderConfigTab('groups');
+        refresh();
+      } catch { toast('Failed to delete group', 'err'); }
     }
 
     async function addStaticUrl() {
@@ -4360,15 +4366,17 @@ function renderPage(processes) {
       const title = document.getElementById('new-url-title').value.trim();
       const group = document.getElementById('new-url-group').value;
       if (!slug || !url) { toast('Slug and URL required', 'err'); return; }
-      await fetch('/api/static-urls', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ slug, url, title: title || slug, group }),
-      });
-      const res = await fetch('/api/config');
-      DASH_CONFIG = await res.json();
-      toast('Added ' + slug, 'ok');
-      renderConfigTab('static');
-      refresh();
+      try {
+        await fetch('/api/static-urls', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ slug, url, title: title || slug, group }),
+        });
+        const res = await fetch('/api/config');
+        if (res.ok) DASH_CONFIG = await res.json();
+        toast('Added ' + slug, 'ok');
+        renderConfigTab('static');
+        refresh();
+      } catch { toast('Failed to add static URL', 'err'); }
     }
 
     async function addMerge() {
@@ -4376,15 +4384,17 @@ function renderPage(processes) {
       const a = document.getElementById('new-merge-a').value.trim();
       const b = document.getElementById('new-merge-b').value.trim();
       if (!key || !a || !b) { toast('All fields required', 'err'); return; }
-      await fetch('/api/merges', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ key, entries: [a, b] }),
-      });
-      const res = await fetch('/api/config');
-      DASH_CONFIG = await res.json();
-      toast('Merged ' + key, 'ok');
-      renderConfigTab('merges');
-      refresh();
+      try {
+        await fetch('/api/merges', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key, entries: [a, b] }),
+        });
+        const res = await fetch('/api/config');
+        if (res.ok) DASH_CONFIG = await res.json();
+        toast('Merged ' + key, 'ok');
+        renderConfigTab('merges');
+        refresh();
+      } catch { toast('Failed to create merge', 'err'); }
     }
 
     async function detectMerges() {
@@ -4428,7 +4438,7 @@ function renderPage(processes) {
           body: JSON.stringify({ group: group || null }),
         });
         const res = await fetch('/api/config');
-        DASH_CONFIG = await res.json();
+        if (res.ok) DASH_CONFIG = await res.json();
         t.done(name + ' → ' + grpName);
         refresh();
       } catch(e) { t.error('Failed to move ' + name); }
@@ -4680,11 +4690,13 @@ function renderPage(processes) {
     }
 
     async function discardScanResults() {
-      await fetch('/api/scan-results', { method: 'DELETE' });
-      DASH_CONFIG.scanResults = null;
-      renderScanEmpty();
-      updateScanBadge();
-      toast('Scan results discarded', 'ok');
+      try {
+        await fetch('/api/scan-results', { method: 'DELETE' });
+        DASH_CONFIG.scanResults = null;
+        renderScanEmpty();
+        updateScanBadge();
+        toast('Scan results discarded', 'ok');
+      } catch { toast('Failed to discard scan results', 'err'); }
     }
 
     function updateScanBadge() {
