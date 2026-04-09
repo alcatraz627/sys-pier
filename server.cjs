@@ -36,7 +36,7 @@ if (!fs.existsSync(CLIENT_LOG_DIR)) fs.mkdirSync(CLIENT_LOG_DIR, { recursive: tr
 // pm2 remains the source of truth for process state; this file is UI-only.
 
 const CONFIG_PATH = path.join(__dirname, 'pm2-manage-config.json');
-const DEFAULT_CONFIG = { version: 2, entries: {}, groups: {}, merges: {}, staticUrls: {}, globalOrder: [], scanResults: null };
+const DEFAULT_CONFIG = { version: 3, entries: {}, groups: {}, merges: {}, staticUrls: {}, globalOrder: [], scanResults: null, daemons: {}, cronOverrides: {}, launchdPinned: [], launchdOverrides: {} };
 
 // Generate a short UUID (8 chars) — sufficient for local config
 function genId() {
@@ -46,7 +46,8 @@ function genId() {
 
 // Migrate v1 config: groups keyed by user-visible names → keyed by UUID with a `name` field
 function migrateConfig(cfg) {
-  if (cfg.version >= 2) return cfg;
+  // v1 → v2: groups keyed by name → keyed by UUID
+  if ((cfg.version || 1) < 2) {
   const oldGroups = cfg.groups || {};
   const newGroups = {};
   const idMap = {}; // old name → new UUID
@@ -73,10 +74,19 @@ function migrateConfig(cfg) {
     }
   }
 
-  cfg.groups = newGroups;
-  cfg.entries = entries;
-  cfg.staticUrls = staticUrls;
-  cfg.version = 2;
+    cfg.groups = newGroups;
+    cfg.entries = entries;
+    cfg.staticUrls = staticUrls;
+    cfg.version = 2;
+  }
+  // v2 → v3: add daemon/cron/launchd keys with empty defaults
+  if (cfg.version < 3) {
+    if (!cfg.daemons) cfg.daemons = {};
+    if (!cfg.cronOverrides) cfg.cronOverrides = {};
+    if (!cfg.launchdPinned) cfg.launchdPinned = [];
+    if (!cfg.launchdOverrides) cfg.launchdOverrides = {};
+    cfg.version = 3;
+  }
   return cfg;
 }
 
@@ -100,10 +110,8 @@ function saveConfig() {
 
 let CONFIG = loadConfig();
 
-// Persist migration if it happened
-if (CONFIG.version === 2) {
-  try { saveConfig(); } catch {}
-}
+// Persist migration if it happened (any version bump)
+try { saveConfig(); } catch {}
 
 // ── Project Scanner ────────────────────────────────────────────────────────
 // Walks ~/Code/ subdirectories looking for pm2-manageable projects.
@@ -281,7 +289,20 @@ function metricsSnapshot() {
   return out;
 }
 
-setInterval(() => { try { recordMetrics(pm2List()); } catch {} }, 5000);
+function recordDaemonMetrics() {
+  for (const key of Object.keys(CONFIG.daemons || {})) {
+    const r = daemonManager.runtime[key];
+    if (!r?.pid) continue;
+    const s = daemonManager.stats(key);
+    const id = `daemon:${key}`;
+    if (!metricsHistory.has(id)) metricsHistory.set(id, { cpu: [], mem: [], ts: [] });
+    const h = metricsHistory.get(id);
+    h.cpu.push(s.cpu); h.mem.push(s.mem); h.ts.push(Date.now());
+    if (h.cpu.length > HISTORY_LENGTH) { h.cpu.shift(); h.mem.shift(); h.ts.shift(); }
+  }
+}
+
+setInterval(() => { try { recordMetrics(pm2List()); recordDaemonMetrics(); } catch {} }, 5000);
 
 // ── Static URL health history ─────────────────────────────────────────────
 // Rolling 20-sample window (~10 min at 30s intervals) of latency + status per URL.
@@ -424,6 +445,553 @@ function validateName(name) {
   return true;
 }
 
+// ── Daemon Manager ─────────────────────────────────────────────────────────
+// Manages arbitrary background processes not tracked by pm2.
+// Spawns them, writes logs, tracks PIDs, and auto-restarts on crash.
+//
+// Registry: CONFIG.daemons[key] = { command, workdir, logFile, errFile, pidFile,
+//   env, autoRestart, maxRestarts, restartDelay }
+// Runtime state is persisted to daemon-runtime.json so server restarts can
+// re-adopt still-running PIDs.
+
+const DAEMON_LOG_DIR = path.join(os.homedir(), '.pm2', 'daemon-logs');
+const DAEMON_STATE_FILE = path.join(__dirname, 'daemon-runtime.json');
+
+try { fs.mkdirSync(DAEMON_LOG_DIR, { recursive: true }); } catch {}
+
+function daemonLogPaths(key, cfg) {
+  return {
+    logFile: cfg.logFile || path.join(DAEMON_LOG_DIR, `${key}-out.log`),
+    errFile: cfg.errFile || path.join(DAEMON_LOG_DIR, `${key}-err.log`),
+    pidFile: cfg.pidFile || path.join(DAEMON_LOG_DIR, `${key}.pid`),
+  };
+}
+
+const daemonManager = (() => {
+  // runtime[key] = { pid, restarts, startedAt, status, lastExit, proc, outStream, errStream }
+  const runtime = {};
+
+  function _saveState() {
+    try {
+      const state = {};
+      for (const [key, r] of Object.entries(runtime)) {
+        state[key] = { pid: r.pid, restarts: r.restarts || 0, startedAt: r.startedAt, status: r.status, lastExit: r.lastExit };
+      }
+      const tmp = DAEMON_STATE_FILE + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf-8');
+      fs.renameSync(tmp, DAEMON_STATE_FILE);
+    } catch {}
+  }
+
+  function _loadState() {
+    try {
+      const saved = JSON.parse(fs.readFileSync(DAEMON_STATE_FILE, 'utf-8'));
+      for (const [key, s] of Object.entries(saved)) {
+        if (!CONFIG.daemons?.[key]) continue;
+        if (s.pid) {
+          let alive = false;
+          try { process.kill(s.pid, 0); alive = true; } catch {}
+          runtime[key] = alive
+            ? { pid: s.pid, restarts: s.restarts || 0, startedAt: s.startedAt, status: 'online', lastExit: null, proc: null, outStream: null, errStream: null }
+            : { pid: null, restarts: s.restarts || 0, startedAt: null, status: 'stopped', lastExit: s.lastExit, proc: null, outStream: null, errStream: null };
+        }
+      }
+    } catch {}
+  }
+
+  function _getRuntime(key) {
+    return runtime[key] || { pid: null, restarts: 0, startedAt: null, status: 'stopped', lastExit: null, proc: null };
+  }
+
+  function start(key) {
+    const cfg = CONFIG.daemons?.[key];
+    if (!cfg) throw new Error(`Daemon '${key}' not registered`);
+
+    const r = _getRuntime(key);
+    if (r.proc) throw new Error(`Daemon '${key}' is already running (PID ${r.pid})`);
+
+    const { logFile, errFile, pidFile } = daemonLogPaths(key, cfg);
+
+    // Parse shell command: split on spaces, respecting first token as executable
+    const parts = cfg.command.trim().match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
+    if (!parts.length) throw new Error('Empty command');
+    const [cmd, ...args] = parts.map((s) => s.replace(/^['"]|['"]$/g, ''));
+
+    const outStream = fs.createWriteStream(logFile, { flags: 'a' });
+    const errStream = fs.createWriteStream(errFile, { flags: 'a' });
+
+    const proc = spawn(cmd, args, {
+      cwd: cfg.workdir || os.homedir(),
+      env: { ...process.env, ...(cfg.env || {}) },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: false,
+    });
+
+    const ts = new Date().toISOString();
+    outStream.write(`\n--- daemon '${key}' started at ${ts} (PID ${proc.pid}) ---\n`);
+    proc.stdout.pipe(outStream);
+    proc.stderr.pipe(errStream);
+
+    try { fs.writeFileSync(pidFile, String(proc.pid), 'utf-8'); } catch {}
+
+    const prevRestarts = r.restarts || 0;
+    runtime[key] = { pid: proc.pid, restarts: prevRestarts, startedAt: Date.now(), status: 'online', lastExit: null, proc, outStream, errStream };
+    _saveState();
+
+    proc.on('exit', (code) => {
+      const cur = runtime[key];
+      if (cur) {
+        cur.proc = null;
+        cur.pid = null;
+        cur.status = cur._stopping ? 'stopped' : (code === 0 ? 'stopped' : 'errored');
+        cur._stopping = false;
+        cur.lastExit = code;
+      }
+      try { fs.unlinkSync(pidFile); } catch {}
+      _saveState();
+
+      const daemonCfg = CONFIG.daemons?.[key];
+      if (!daemonCfg) return;
+      const maxR = daemonCfg.maxRestarts ?? 5;
+      const delay = daemonCfg.restartDelay ?? 3000;
+      // Auto-restart only on non-zero exits
+      if (daemonCfg.autoRestart && code !== 0 && (cur?.restarts || 0) < maxR) {
+        if (cur) cur.restarts++;
+        setTimeout(() => {
+          if (CONFIG.daemons?.[key]) { try { start(key); } catch {} }
+        }, delay);
+      }
+    });
+
+    return proc.pid;
+  }
+
+  function stop(key) {
+    const r = runtime[key];
+    if (!r?.proc) throw new Error(`Daemon '${key}' is not running`);
+    return new Promise((resolve) => {
+      const proc = r.proc;
+      r._stopping = true;
+      r.status = 'stopping';
+      const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 8000);
+      proc.on('exit', () => { clearTimeout(timer); resolve(); });
+      try { proc.kill('SIGTERM'); } catch { clearTimeout(timer); resolve(); }
+    });
+  }
+
+  async function restart(key) {
+    const r = runtime[key];
+    if (r?.proc) await stop(key);
+    return start(key);
+  }
+
+  function stats(key) {
+    const r = runtime[key];
+    if (!r?.pid) return { cpu: 0, mem: 0 };
+    try {
+      const raw = execSync(`ps -p ${r.pid} -o %cpu=,rss=`, { encoding: 'utf-8', timeout: 2000 }).trim();
+      const parts = raw.trim().split(/\s+/);
+      const cpu = parseFloat(parts[0]) || 0;
+      const mem = (parseInt(parts[1], 10) || 0) * 1024; // rss in KB → bytes
+      return { cpu, mem };
+    } catch { return { cpu: 0, mem: 0 }; }
+  }
+
+  function signal(key, sig) {
+    const r = runtime[key];
+    if (!r?.pid) throw new Error(`Daemon '${key}' is not running`);
+    process.kill(r.pid, sig);
+  }
+
+  function flushLogs(key) {
+    const cfg = CONFIG.daemons?.[key];
+    if (!cfg) throw new Error(`Daemon '${key}' not found`);
+    const { logFile, errFile } = daemonLogPaths(key, cfg);
+    try { fs.truncateSync(logFile, 0); } catch {}
+    try { fs.truncateSync(errFile, 0); } catch {}
+  }
+
+  function getSummary(key) {
+    const cfg = CONFIG.daemons?.[key] || {};
+    const r = _getRuntime(key);
+    const s = r.pid ? stats(key) : { cpu: 0, mem: 0 };
+    const entryCfg = CONFIG.entries?.[`daemon:${key}`] || {};
+    const { logFile, errFile } = daemonLogPaths(key, cfg);
+    return {
+      id: `daemon:${key}`,
+      type: 'daemon',
+      key,
+      status: r.status || 'stopped',
+      pid: r.pid || null,
+      uptime_ms: r.startedAt && r.status === 'online' ? Date.now() - r.startedAt : null,
+      uptime_human: r.startedAt && r.status === 'online' ? formatUptime(r.startedAt) : null,
+      restarts: r.restarts || 0,
+      lastExit: r.lastExit ?? null,
+      cpu_percent: s.cpu,
+      memory_bytes: s.mem,
+      memory_human: formatMemory(s.mem),
+      command: cfg.command || '',
+      workdir: cfg.workdir || '',
+      logFile,
+      errFile,
+      env: cfg.env || {},
+      autoRestart: cfg.autoRestart ?? false,
+      maxRestarts: cfg.maxRestarts ?? 5,
+      _color: entryCfg.color || null,
+      _title: entryCfg.title || null,
+      _group: entryCfg.group || null,
+      _icon: entryCfg.icon || null,
+      _order: entryCfg.order ?? 999,
+    };
+  }
+
+  function listAll() {
+    return Object.keys(CONFIG.daemons || {}).map(getSummary);
+  }
+
+  // Initialize on startup: load persisted runtime state
+  _loadState();
+
+  return { start, stop, restart, stats, signal, flushLogs, getSummary, listAll, runtime };
+})();
+
+// ── Cron Job Utilities ─────────────────────────────────────────────────────
+
+function _cronId(schedule, command) {
+  const str = `${schedule}|${command}`;
+  let h = 5381;
+  for (const c of str) h = ((h << 5) + h + c.charCodeAt(0)) & 0xffffffff;
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+
+function _readCrontabLines() {
+  try {
+    return execSync('crontab -l 2>/dev/null', { encoding: 'utf-8', timeout: 5000 }).split('\n');
+  } catch { return []; }
+}
+
+
+const _CRON_DISABLED_RE = /^(@\w+|(\*|[\d,\-\/]+)\s+(\*|[\d,\-\/]+)\s+(\*|[\d,\-\/]+)\s+(\*|[\d,\-\/]+)\s+(\*|[\d,\-\/]+))\s+/;
+
+function _parseCronLine(workLine) {
+  // Returns { schedule, command } or null
+  if (workLine.startsWith('@')) {
+    const parts = workLine.split(/\s+/);
+    if (parts.length < 2) return null;
+    return { schedule: parts[0], command: parts.slice(1).join(' ') };
+  }
+  const parts = workLine.split(/\s+/);
+  if (parts.length < 6) return null;
+  return { schedule: parts.slice(0, 5).join(' '), command: parts.slice(5).join(' ') };
+}
+
+function parseCrontab() {
+  const raw = _readCrontabLines();
+  const entries = [];
+  for (let lineIndex = 0; lineIndex < raw.length; lineIndex++) {
+    const line = raw[lineIndex];
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    let enabled = true;
+    let workLine = trimmed;
+    if (workLine.startsWith('#')) {
+      const stripped = workLine.replace(/^#+\s*/, '');
+      if (_CRON_DISABLED_RE.test(stripped)) { enabled = false; workLine = stripped; }
+      else continue; // plain comment
+    }
+
+    const parsed = _parseCronLine(workLine);
+    if (!parsed) continue;
+    const { schedule, command } = parsed;
+    const id = _cronId(schedule, command);
+    // Overlay config-based disable state (avoids writing to crontab which hangs in daemon context).
+    // Note: `enabled` reflects *intent* (what the user toggled via dashboard), not crontab file state.
+    // If a cron is commented out natively AND has override.disabled=false, we report enabled:true
+    // (the dashboard intends it enabled; crontab cannot be written from daemon context).
+    const override = CONFIG.cronOverrides?.[id];
+    if (override !== undefined) enabled = !override.disabled;
+    const nextRunMs = cronNextRun(schedule);
+    const humanSchedule = cronToHuman(schedule);
+    const entryCfg = CONFIG.entries?.[`cron:${id}`] || {};
+
+    entries.push({
+      id, type: 'cron', schedule, command, enabled, lineIndex,
+      nextRunMs, humanSchedule,
+      _title: entryCfg.title || null,
+      _color: entryCfg.color || null,
+      _group: entryCfg.group || null,
+      _icon: entryCfg.icon || null,
+    });
+  }
+
+  // Prune stale overrides for cron IDs that no longer exist in the crontab.
+  // Prevents config bloat when entries are externally deleted while an override is set.
+  if (CONFIG.cronOverrides && Object.keys(CONFIG.cronOverrides).length > 0) {
+    const liveIds = new Set(entries.map((e) => e.id));
+    let pruned = false;
+    for (const oid of Object.keys(CONFIG.cronOverrides)) {
+      if (!liveIds.has(oid)) { delete CONFIG.cronOverrides[oid]; pruned = true; }
+    }
+    if (pruned) saveConfig();
+  }
+
+  return entries;
+}
+
+function cronNextRun(schedule) {
+  const aliases = { '@yearly': '0 0 1 1 *', '@annually': '0 0 1 1 *', '@monthly': '0 0 1 * *', '@weekly': '0 0 * * 0', '@daily': '0 0 * * *', '@midnight': '0 0 * * *', '@hourly': '0 * * * *' };
+  if (schedule in aliases) return cronNextRun(aliases[schedule]);
+  if (schedule === '@reboot') return null;
+
+  const parts = schedule.split(/\s+/);
+  if (parts.length !== 5) return null;
+  const [minP, hourP, domP, monP, dowP] = parts;
+
+  function expand(spec, lo, hi) {
+    const vals = new Set();
+    for (const seg of spec.split(',')) {
+      if (seg === '*') { for (let v = lo; v <= hi; v++) vals.add(v); }
+      else if (seg.includes('/')) {
+        const [rng, step] = seg.split('/');
+        const start = rng === '*' ? lo : parseInt(rng, 10);
+        for (let v = start; v <= hi; v += parseInt(step, 10) || 1) vals.add(v);
+      } else if (seg.includes('-')) {
+        const [a, b] = seg.split('-').map(Number);
+        for (let v = a; v <= b; v++) vals.add(v);
+      } else { vals.add(parseInt(seg, 10)); }
+    }
+    return vals;
+  }
+
+  const mins = expand(minP, 0, 59), hours = expand(hourP, 0, 23);
+  const doms = expand(domP, 1, 31), mons = expand(monP, 1, 12), dows = expand(dowP, 0, 6);
+  const domWild = domP === '*', dowWild = dowP === '*';
+
+  const now = new Date();
+  now.setSeconds(0, 0);
+  now.setMinutes(now.getMinutes() + 1);
+  const limit = new Date(now.getTime() + 366 * 24 * 60 * 60 * 1000);
+
+  while (now < limit) {
+    if (!mons.has(now.getMonth() + 1)) { now.setMonth(now.getMonth() + 1, 1); now.setHours(0, 0, 0, 0); continue; }
+    const domMatch = doms.has(now.getDate()), dowMatch = dows.has(now.getDay());
+    const dayMatch = domWild && dowWild ? true : domWild ? dowMatch : dowWild ? domMatch : (domMatch || dowMatch);
+    if (!dayMatch) { now.setDate(now.getDate() + 1); now.setHours(0, 0, 0, 0); continue; }
+    if (!hours.has(now.getHours())) { now.setHours(now.getHours() + 1, 0, 0, 0); continue; }
+    if (!mins.has(now.getMinutes())) { now.setMinutes(now.getMinutes() + 1, 0, 0); continue; }
+    return now.getTime();
+  }
+  return null;
+}
+
+function cronToHuman(schedule) {
+  const ALIASES = { '@reboot': 'On reboot', '@yearly': 'Yearly (Jan 1 midnight)', '@annually': 'Yearly (Jan 1 midnight)', '@monthly': 'Monthly (1st midnight)', '@weekly': 'Weekly (Sun midnight)', '@daily': 'Daily at midnight', '@midnight': 'Daily at midnight', '@hourly': 'Every hour' };
+  if (schedule in ALIASES) return ALIASES[schedule];
+
+  const parts = schedule.split(/\s+/);
+  if (parts.length !== 5) return schedule;
+  const [min, hour, dom, month, dow] = parts;
+  const DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+  let when = '';
+  if (hour !== '*' && min !== '*' && !hour.includes(',') && !min.includes(',') && !hour.includes('/') && !min.includes('/')) {
+    const h = parseInt(hour, 10), m = parseInt(min, 10);
+    if (!isNaN(h) && !isNaN(m)) {
+      const h12 = h % 12 || 12;
+      when = ` at ${h12}:${String(m).padStart(2, '0')} ${h >= 12 ? 'PM' : 'AM'}`;
+    }
+  } else if (min.startsWith('*/')) { return `Every ${min.slice(2)} min`; }
+  else if (hour.startsWith('*/') && (min === '0' || min === '00')) { return `Every ${hour.slice(2)}h`; }
+
+  if (dom === '*' && month === '*' && dow === '*') return `Daily${when}`;
+  if (dom === '*' && month === '*') {
+    const days = dow.split(',').map((d) => DOW[parseInt(d, 10)] || d).join('/');
+    return `Every ${days}${when}`;
+  }
+  if (dom !== '*' && month === '*' && dow === '*') return `Monthly day ${dom}${when}`;
+  return `${schedule}`;
+}
+
+function formatTimeUntil(ms) {
+  if (!ms) return '—';
+  const diff = ms - Date.now();
+  if (diff <= 0) return 'now';
+  const s = Math.floor(diff / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `in ${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `in ${h}h ${m % 60}m`;
+  return `in ${Math.floor(h / 24)}d ${h % 24}h`;
+}
+
+function setCronEnabled(id, enabled) {
+  // Store enable/disable in config JSON — avoids writing to crontab which hangs
+  // in pm2 daemon context (macOS security blocks crontab writes outside GUI session).
+  if (!CONFIG.cronOverrides) CONFIG.cronOverrides = {};
+
+  // Determine native crontab state (without config overlay) so we can clean up
+  // overrides that are redundant (i.e., user clicked enable on an already-enabled cron).
+  const raw = _readCrontabLines();
+  let nativeEnabled = null;
+  for (const line of raw) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let lineEnabled = true;
+    let workLine = trimmed;
+    if (workLine.startsWith('#')) {
+      const stripped = workLine.replace(/^#+\s*/, '');
+      if (_CRON_DISABLED_RE.test(stripped)) { lineEnabled = false; workLine = stripped; }
+      else continue;
+    }
+    const parsed = _parseCronLine(workLine);
+    if (parsed && _cronId(parsed.schedule, parsed.command) === id) {
+      nativeEnabled = lineEnabled;
+      break;
+    }
+  }
+
+  if (nativeEnabled === enabled) {
+    // Matches native crontab state — remove any stale override
+    delete CONFIG.cronOverrides[id];
+  } else {
+    CONFIG.cronOverrides[id] = { disabled: !enabled };
+  }
+  saveConfig();
+}
+
+// ── LaunchD Utilities ─────────────────────────────────────────────────────
+
+const LAUNCH_AGENTS_DIR = path.join(os.homedir(), 'Library', 'LaunchAgents');
+const _LAUNCHD_CACHE = { data: null, ts: 0 };
+const _LAUNCHD_CACHE_TTL = 8000; // 8s — avoid hammering plist reads every 5s poll
+
+function _parsePlist(filePath) {
+  try {
+    const out = execSync(
+      `python3 -c "import plistlib,json,sys; d=plistlib.loads(open(sys.argv[1],'rb').read()); print(json.dumps(d))" ${JSON.stringify(filePath)}`,
+      { encoding: 'utf-8', timeout: 5000 }
+    );
+    return JSON.parse(out.trim());
+  } catch { return null; }
+}
+
+function _launchdStatus(label) {
+  try {
+    const uid = execSync('id -u', { encoding: 'utf-8' }).trim();
+    // Use `launchctl print gui/<uid>/<label>` — works from any session context (incl. daemons)
+    // Unlike `launchctl list`, this queries the GUI domain explicitly
+    const out = execSync(`launchctl print gui/${uid}/${label} 2>/dev/null`, { encoding: 'utf-8', timeout: 3000 });
+    const pid = (out.match(/^\s+pid\s*=\s*(\d+)/m) || [])[1];
+    const exitMatch = out.match(/^\s+last exit code\s*=\s*(-?\d+)/m);
+    const exitCode = exitMatch ? exitMatch[1] : null;
+    return {
+      loaded: true,
+      pid: pid ? parseInt(pid, 10) : null,
+      lastExitStatus: exitCode != null ? parseInt(exitCode, 10) : null,
+    };
+  } catch { return { loaded: false, pid: null, lastExitStatus: null }; }
+}
+
+function _launchdSchedule(plist) {
+  const sci = plist.StartCalendarInterval;
+  if (sci) {
+    const p = Array.isArray(sci) ? sci[0] : sci;
+    const h = p.Hour != null ? p.Hour : null;
+    const m = p.Minute != null ? p.Minute : 0;
+    if (h != null) {
+      const h12 = h % 12 || 12;
+      const t = `${h12}:${String(m).padStart(2, '0')} ${h >= 12 ? 'PM' : 'AM'}`;
+      const DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+      if (p.Weekday != null) return `Every ${DOW[p.Weekday]} at ${t}`;
+      if (p.Day != null) return `Monthly day ${p.Day} at ${t}`;
+      return `Daily at ${t}`;
+    }
+  }
+  if (plist.StartInterval) {
+    const s = plist.StartInterval;
+    if (s < 60) return `Every ${s}s`;
+    if (s < 3600) return `Every ${Math.floor(s / 60)}m`;
+    return `Every ${Math.floor(s / 3600)}h`;
+  }
+  return plist.RunAtLoad ? 'On load' : null;
+}
+
+function listLaunchAgents() {
+  const now = Date.now();
+  if (_LAUNCHD_CACHE.data && now - _LAUNCHD_CACHE.ts < _LAUNCHD_CACHE_TTL) return _LAUNCHD_CACHE.data;
+
+  let plistFiles = [];
+  try {
+    plistFiles = fs.readdirSync(LAUNCH_AGENTS_DIR)
+      .filter((f) => f.endsWith('.plist'))
+      .map((f) => path.join(LAUNCH_AGENTS_DIR, f));
+  } catch {}
+  for (const pinned of (CONFIG.launchdPinned || [])) {
+    if (!plistFiles.includes(pinned)) plistFiles.push(pinned);
+  }
+
+  const agents = plistFiles.map((plistPath) => {
+    const plist = _parsePlist(plistPath);
+    if (!plist) return null;
+
+    const label = plist.Label || path.basename(plistPath, '.plist');
+    const status = _launchdStatus(label);
+    const args = plist.ProgramArguments || (plist.Program ? [plist.Program] : []);
+    const command = args.join(' ');
+    const program = args[0] || '';
+    const isOnline = !!status.pid;
+    const overallStatus = !status.loaded ? 'stopped'
+      : isOnline ? 'online'
+      : status.lastExitStatus ? 'errored'
+      : 'stopped';
+
+    const entryCfg = CONFIG.entries?.[`launchd:${label}`] || {};
+
+    return {
+      id: `launchd:${label}`,
+      type: 'launchd',
+      label,
+      plistPath,
+      command,
+      program,
+      status: overallStatus,
+      pid: status.pid,
+      loaded: status.loaded,
+      lastExitStatus: status.lastExitStatus,
+      runAtLoad: plist.RunAtLoad === true,
+      keepAlive: !!plist.KeepAlive,
+      schedule: _launchdSchedule(plist),
+      stdoutPath: plist.StandardOutPath || null,
+      stderrPath: plist.StandardErrorPath || null,
+      _title: entryCfg.title || null,
+      _color: entryCfg.color || null,
+      _group: entryCfg.group || null,
+      _icon: entryCfg.icon || null,
+    };
+  }).filter(Boolean);
+
+  _LAUNCHD_CACHE.data = agents;
+  _LAUNCHD_CACHE.ts = now;
+  return agents;
+}
+
+function invalidateLaunchdCache() { _LAUNCHD_CACHE.ts = 0; }
+
+function doLaunchctl(action, label, plistPath) {
+  const uid = execSync('id -u', { encoding: 'utf-8' }).trim();
+  const actions = {
+    load:      () => execSync(`launchctl load ${JSON.stringify(plistPath)}`, { timeout: 10000 }),
+    unload:    () => execSync(`launchctl unload ${JSON.stringify(plistPath)}`, { timeout: 10000 }),
+    kickstart: () => execSync(`launchctl kickstart -k gui/${uid}/${label}`, { timeout: 10000 }),
+    stop:      () => execSync(`launchctl stop ${label}`, { timeout: 10000 }),
+  };
+  if (!actions[action]) throw new Error(`Unknown launchctl action: ${action}`);
+  actions[action]();
+  invalidateLaunchdCache();
+}
+
 // ── Merge detection ────────────────────────────────────────────────────────
 
 const MERGE_SUFFIXES = ['-frontend', '-backend', '-api', '-web', '-client', '-server', '-ui', '-service', '-worker'];
@@ -534,7 +1102,7 @@ function renderSingleCard(p) {
 
   const colorDot = cfg.color ? `<span class="color-dot" style="background:${cfg.color}" onclick="event.stopPropagation();toggleColorPicker('${escHtml(p.name)}',this)" title="Click to change color"></span>` : `<span class="color-dot color-dot-empty" onclick="event.stopPropagation();toggleColorPicker('${escHtml(p.name)}',this)" title="Click to set color"></span>`;
 
-  return `<div class="card card-enter" data-status="${status}" data-name="${escHtml(p.name)}" style="${colorStyle}">
+  return `<div class="card card-enter" data-status="${status}" data-name="${escHtml(p.name)}" data-type="server" style="${colorStyle}">
   <div class="card-header">
     <div class="name-row">
       <span class="drag-handle" draggable="true" ondragstart="onDragStart(event,'${escHtml(p.name)}')" title="Drag to reorder">⠿</span>
@@ -584,7 +1152,7 @@ function renderStaticUrlCard(slug, entry) {
       faviconHtml = `<img class="static-favicon" src="https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=32" alt="" onerror="this.outerHTML='<span class=\\'static-badge\\' title=\\'Static URL monitor\\'>🔗</span>'">`;
     }
   } catch {}
-  return `<div class="card card-static card-enter" data-name="static:${escHtml(slug)}" style="${colorStyle}">
+  return `<div class="card card-static card-enter" data-name="static:${escHtml(slug)}" data-type="static" style="${colorStyle}">
   <div class="card-header">
     <div class="name-row">
       <span class="drag-handle" draggable="true" ondragstart="onDragStart(event,'static:${escHtml(slug)}')" title="Drag to reorder">⠿</span>
@@ -605,6 +1173,213 @@ function renderStaticUrlCard(slug, entry) {
     <button class="btn btn-danger" onclick="deleteStaticUrl('${escHtml(slug)}')" title="Remove this static URL">✕ Remove</button>
   </div>
 </div>`;
+}
+
+function renderDaemonCard(key, summary) {
+  const status = summary.status || 'stopped';
+  const isOnline = status === 'online';
+  const entryCfg = CONFIG.entries?.[`daemon:${key}`] || {};
+  const colorStyle = entryCfg.color ? `border-top: 3px solid ${entryCfg.color}` : '';
+  const icon = entryCfg.icon || _daemonDefaultIcon(summary.command || '');
+  const displayTitle = entryCfg.title || key;
+  const warnRestarts = summary.restarts >= 3;
+
+  const cpu = isOnline ? `${summary.cpu_percent.toFixed(1)}%` : '—';
+  const mem = isOnline ? summary.memory_human : '—';
+
+  const statusTip = {
+    online: 'Daemon is running',
+    stopped: 'Daemon was stopped — click Start to resume',
+    errored: 'Daemon crashed — check logs',
+  }[status] || status;
+
+  const colorDot = entryCfg.color
+    ? `<span class="color-dot" style="background:${entryCfg.color}" onclick="event.stopPropagation();toggleColorPicker('daemon:${escHtml(key)}',this)" title="Click to change color"></span>`
+    : `<span class="color-dot color-dot-empty" onclick="event.stopPropagation();toggleColorPicker('daemon:${escHtml(key)}',this)" title="Click to set color"></span>`;
+
+  const primaryActions = isOnline
+    ? `<button class="btn btn-warn action-btn" onclick="doDaemonAction('restart','${escHtml(key)}',this)" title="Restart daemon">↺ Restart</button>
+       <button class="btn btn-danger action-btn" onclick="doDaemonAction('stop','${escHtml(key)}',this)" title="Stop daemon">■ Stop</button>`
+    : `<button class="btn btn-ok action-btn" onclick="doDaemonAction('start','${escHtml(key)}',this)" title="Start daemon">▶ Start</button>
+       <button class="btn btn-danger action-btn" onclick="confirmDeleteDaemon('${escHtml(key)}')" title="Remove daemon from registry">✕ Remove</button>`;
+
+  const cmdShort = summary.command.length > 50 ? summary.command.slice(0, 50) + '…' : summary.command;
+  const cwdShort = (summary.workdir || '').replace(os.homedir(), '~');
+
+  return `<div class="card card-enter" data-status="${status}" data-name="${escHtml(`daemon:${key}`)}" data-type="daemon" style="${colorStyle}">
+  <div class="card-header">
+    <div class="name-row">
+      <span class="drag-handle" draggable="true" ondragstart="onDragStart(event,'daemon:${escHtml(key)}')" title="Drag to reorder">⠿</span>
+      <span class="status-dot ${status} ${status === 'errored' ? 'status-pulse' : ''}" title="${escHtml(statusTip)}"></span>
+      ${colorDot}
+      <span class="proc-icon" title="Custom daemon">${escHtml(icon)}</span>
+      <span class="proc-name" ondblclick="startTitleEdit('daemon:${escHtml(key)}',this)">${escHtml(displayTitle)}</span>
+      <span class="type-badge type-badge--daemon" title="Custom daemon managed by pm2-manage">daemon</span>
+    </div>
+    <span class="badge ${status}" title="${escHtml(statusTip)}">${status}</span>
+  </div>
+  <div class="card-body">
+    <div class="cwd" title="${escHtml(summary.command)}" style="font-family:monospace;font-size:0.68rem;color:var(--text-faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 0">${escHtml(cmdShort)}</div>
+    <div class="stats-row">
+      <div class="stat" title="Time since daemon started"><span class="stat-label">uptime</span><span class="stat-val">${summary.uptime_human || '—'}</span></div>
+      <div class="stat" title="CPU % sampled via ps"><span class="stat-label">cpu</span><span class="stat-val">${cpu}</span></div>
+      <div class="stat" title="Resident Set Size (RSS)"><span class="stat-label">mem</span><span class="stat-val">${mem}</span></div>
+      <div class="stat ${warnRestarts ? 'warn' : ''}" title="${warnRestarts ? '⚠ High restart count — check logs for a crash loop' : 'Number of auto-restarts'}">
+        <span class="stat-label">restarts</span><span class="stat-val">${summary.restarts}</span>
+      </div>
+    </div>
+    <canvas class="sparkline" data-name="${escHtml(`daemon:${key}`)}" title="CPU/Memory over the last 5 minutes"></canvas>
+    ${cwdShort ? `<div class="cwd" onclick="openCwd('${escHtml(summary.workdir)}')" title="Click to open in Finder: ${escHtml(summary.workdir)}" style="cursor:pointer">${escHtml(cwdShort)} <span style="color:var(--text-faint);font-size:0.55rem">↗</span></div>` : ''}
+  </div>
+  <div class="card-actions">
+    ${primaryActions}
+    <button class="btn" onclick="openDaemonLogs('${escHtml(key)}')" title="View daemon logs">⋮ Logs</button>
+    <button class="btn" onclick="openDaemonInfo('${escHtml(key)}')" title="View daemon details">ℹ Info</button>
+    ${isOnline ? `<button class="btn action-btn" onclick="doDaemonAction('flush-logs','${escHtml(key)}',this)" title="Clear log files">⌫ Flush</button>` : ''}
+  </div>
+</div>`;
+}
+
+function _daemonDefaultIcon(command) {
+  const c = command.toLowerCase();
+  if (c.includes('.py') || c.includes('python')) return '🐍';
+  if (c.includes('node') || c.includes('npm') || c.includes('.js')) return '🟢';
+  if (c.includes('ruby') || c.includes('.rb')) return '💎';
+  if (c.includes('nginx') || c.includes('proxy')) return '🌐';
+  if (c.includes('backup') || c.includes('sync') || c.includes('rsync')) return '💾';
+  if (c.includes('claude')) return '🐳';
+  return '🔧';
+}
+
+function renderCronCard(entry) {
+  const { id, schedule, command, enabled, nextRunMs, humanSchedule } = entry;
+  const status = enabled ? 'scheduled' : 'stopped';
+  const entryCfg = CONFIG.entries?.[`cron:${id}`] || {};
+  const colorStyle = entryCfg.color ? `border-top: 3px solid ${entryCfg.color}` : '';
+  const icon = entryCfg.icon || '🕐';
+  const displayTitle = entryCfg.title || _cronDefaultTitle(command);
+  const nextStr = formatTimeUntil(nextRunMs);
+  const cmdShort = command.length > 55 ? command.slice(0, 55) + '…' : command;
+
+  const colorDot = entryCfg.color
+    ? `<span class="color-dot" style="background:${entryCfg.color}" onclick="event.stopPropagation();toggleColorPicker('cron:${escHtml(id)}',this)" title="Click to change color"></span>`
+    : `<span class="color-dot color-dot-empty" onclick="event.stopPropagation();toggleColorPicker('cron:${escHtml(id)}',this)" title="Click to set color"></span>`;
+
+  const primaryActions = enabled
+    ? `<button class="btn btn-ok action-btn" onclick="doCronAction('run-now','${escHtml(id)}',this)" title="Run this command immediately">▶ Run Now</button>
+       <button class="btn action-btn" onclick="doCronAction('disable','${escHtml(id)}',this)" title="Comment out this cron entry">⏸ Disable</button>`
+    : `<button class="btn btn-ok action-btn" onclick="doCronAction('enable','${escHtml(id)}',this)" title="Uncomment this cron entry">▶ Enable</button>`;
+
+  return `<div class="card card-enter" data-status="${status}" data-name="${escHtml(`cron:${id}`)}" data-type="cron" style="${colorStyle}">
+  <div class="card-header">
+    <div class="name-row">
+      <span class="drag-handle" draggable="true" ondragstart="onDragStart(event,'cron:${escHtml(id)}')" title="Drag to reorder">⠿</span>
+      <span class="status-dot ${status}" title="${enabled ? 'Scheduled and active' : 'Disabled (commented out)'}"></span>
+      ${colorDot}
+      <span class="proc-icon" title="Cron job">${escHtml(icon)}</span>
+      <span class="proc-name" ondblclick="startTitleEdit('cron:${escHtml(id)}',this)">${escHtml(displayTitle)}</span>
+      <span class="type-badge type-badge--cron" title="Crontab entry">cron</span>
+    </div>
+    <span class="badge ${status}" title="${enabled ? 'Active cron job' : 'Disabled'}">${status}</span>
+  </div>
+  <div class="card-body">
+    <div class="cwd" title="${escHtml(command)}" style="font-family:monospace;font-size:0.68rem;color:var(--text-faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 0">${escHtml(cmdShort)}</div>
+    <div class="stats-row">
+      <div class="stat" title="Cron schedule expression"><span class="stat-label">schedule</span><span class="stat-val" style="font-size:0.6rem;font-family:monospace">${escHtml(schedule)}</span></div>
+      <div class="stat" title="Time until next scheduled run"><span class="stat-label">next run</span><span class="stat-val">${escHtml(nextStr)}</span></div>
+    </div>
+    <div style="color:var(--text-faint);font-size:0.65rem;padding:2px 0" title="Human-readable schedule">${escHtml(humanSchedule)}</div>
+  </div>
+  <div class="card-actions">
+    ${primaryActions}
+    <button class="btn" onclick="openCronDetail('${escHtml(id)}')" title="View schedule details">ℹ Info</button>
+  </div>
+</div>`;
+}
+
+function _cronDefaultTitle(command) {
+  // Extract a short readable name from the command
+  const cmd = command.replace(/^(bash|sh|zsh)\s+-c\s+['"]?/, '').trim();
+  const parts = cmd.split(/\s+/);
+  const base = parts[0].split('/').pop().replace(/\.(sh|py|js|rb)$/, '');
+  const arg = parts[1] ? parts[1].replace(/^-+/, '').slice(0, 10) : '';
+  return arg ? `${base} ${arg}` : base;
+}
+
+function renderLaunchdCard(agent) {
+  const { label, status, pid, loaded, schedule, command, runAtLoad, keepAlive } = agent;
+  const isOnline = status === 'online';
+  const entryCfg = CONFIG.entries?.[`launchd:${label}`] || {};
+  const colorStyle = entryCfg.color ? `border-top: 3px solid ${entryCfg.color}` : '';
+  const icon = entryCfg.icon || _launchdDefaultIcon(label, command);
+  const displayTitle = entryCfg.title || _launchdDefaultTitle(label);
+  const cmdShort = command.length > 55 ? command.slice(0, 55) + '…' : command;
+
+  const statusTip = { online: 'Running', stopped: 'Not running', errored: 'Last exit was non-zero' }[status] || status;
+
+  const colorDot = entryCfg.color
+    ? `<span class="color-dot" style="background:${entryCfg.color}" onclick="event.stopPropagation();toggleColorPicker('launchd:${escHtml(label)}',this)" title="Click to change color"></span>`
+    : `<span class="color-dot color-dot-empty" onclick="event.stopPropagation();toggleColorPicker('launchd:${escHtml(label)}',this)" title="Click to set color"></span>`;
+
+  const primaryActions = loaded
+    ? isOnline
+      ? `<button class="btn btn-warn action-btn" onclick="doLaunchdAction('kickstart','${escHtml(label)}',this)" title="Force-restart (kickstart -k)">↺ Restart</button>
+         <button class="btn btn-danger action-btn" onclick="doLaunchdAction('stop','${escHtml(label)}',this)" title="Stop the service (launchctl stop)">■ Stop</button>
+         <button class="btn action-btn" onclick="doLaunchdAction('unload','${escHtml(label)}',this)" title="Unload the LaunchAgent (launchctl unload)">⏏ Unload</button>`
+      : `<button class="btn btn-ok action-btn" onclick="doLaunchdAction('kickstart','${escHtml(label)}',this)" title="Kickstart the service">▶ Start</button>
+         <button class="btn action-btn" onclick="doLaunchdAction('unload','${escHtml(label)}',this)" title="Unload the LaunchAgent">⏏ Unload</button>`
+    : `<button class="btn btn-ok action-btn" onclick="doLaunchdAction('load','${escHtml(label)}',this)" title="Load the LaunchAgent (launchctl load)">⬆ Load</button>`;
+
+  const keepAliveTag = keepAlive ? `<span style="color:var(--warning);font-size:0.6rem;margin-left:4px" title="KeepAlive — launchd will restart if it exits">♻</span>` : '';
+  const scheduleStr = schedule || (runAtLoad ? 'On load' : '—');
+
+  return `<div class="card card-enter" data-status="${status}" data-name="${escHtml(`launchd:${label}`)}" data-type="launchd" style="${colorStyle}">
+  <div class="card-header">
+    <div class="name-row">
+      <span class="drag-handle" draggable="true" ondragstart="onDragStart(event,'launchd:${escHtml(label)}')" title="Drag to reorder">⠿</span>
+      <span class="status-dot ${status} ${status === 'errored' ? 'status-pulse' : ''}" title="${escHtml(statusTip)}"></span>
+      ${colorDot}
+      <span class="proc-icon" title="LaunchAgent">${escHtml(icon)}</span>
+      <span class="proc-name" ondblclick="startTitleEdit('launchd:${escHtml(label)}',this)">${escHtml(displayTitle)}</span>${keepAliveTag}
+      <span class="type-badge type-badge--launchd" title="macOS LaunchAgent">launchd</span>
+    </div>
+    <span class="badge ${status}" title="${escHtml(statusTip)}">${status}</span>
+  </div>
+  <div class="card-body">
+    <div class="cwd" title="${escHtml(command)}" style="font-family:monospace;font-size:0.68rem;color:var(--text-faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 0">${escHtml(cmdShort)}</div>
+    <div class="stats-row">
+      <div class="stat" title="Process ID (if running)"><span class="stat-label">pid</span><span class="stat-val">${pid || '—'}</span></div>
+      <div class="stat" title="Trigger / schedule"><span class="stat-label">trigger</span><span class="stat-val" style="font-size:0.65rem">${escHtml(scheduleStr)}</span></div>
+      <div class="stat" title="Loaded into launchd domain"><span class="stat-label">loaded</span><span class="stat-val">${loaded ? 'yes' : 'no'}</span></div>
+    </div>
+    <div style="color:var(--text-faint);font-size:0.6rem;padding:2px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(agent.plistPath)}">${escHtml(agent.plistPath.replace(os.homedir(), '~'))}</div>
+  </div>
+  <div class="card-actions">
+    ${primaryActions}
+    <button class="btn" onclick="openLaunchdDetail('${escHtml(label)}')" title="View agent details">ℹ Info</button>
+  </div>
+</div>`;
+}
+
+function _launchdDefaultTitle(label) {
+  // homebrew.mxcl.nginx → nginx, com.google.keystone.agent → keystone agent
+  return label.replace(/^homebrew\.mxcl\./, '').replace(/^com\.[^.]+\./, '').replace(/\./g, ' ');
+}
+
+function _launchdDefaultIcon(label, command) {
+  const l = label.toLowerCase(), c = (command || '').toLowerCase();
+  if (l.includes('nginx') || c.includes('nginx')) return '🌐';
+  if (l.includes('redis') || c.includes('redis')) return '🟥';
+  if (l.includes('mongo') || c.includes('mongo')) return '🍃';
+  if (l.includes('pm2') || c.includes('pm2')) return '⚙️';
+  if (l.includes('chrome') || l.includes('google') || c.includes('chrome')) return '🌍';
+  if (l.includes('steam') || l.includes('valve')) return '🎮';
+  if (l.includes('ssh') || l.includes('openssh')) return '🔑';
+  if (l.includes('karabiner')) return '⌨️';
+  if (l.includes('adobe')) return '🅰️';
+  if (c.includes('python') || c.includes('.py')) return '🐍';
+  if (c.includes('node') || c.includes('.js')) return '🟢';
+  return '⚙️';
 }
 
 function renderMergedCard(mergeKey, entries, processByName) {
@@ -650,7 +1425,7 @@ function renderMergedCard(mergeKey, entries, processByName) {
     </div>`;
   }).join('');
 
-  return `<div class="card card-merged card-enter" data-name="${escHtml(mergeKey)}" style="${colorStyle}">
+  return `<div class="card card-merged card-enter" data-name="${escHtml(mergeKey)}" data-type="server" style="${colorStyle}">
   <div class="card-header">
     <div class="name-row">
       <span class="drag-handle" draggable="true" ondragstart="onDragStart(event,'${escHtml(mergeKey)}')" title="Drag to reorder">⠿</span>
@@ -711,6 +1486,25 @@ function renderCards(processes) {
     items.push({ type: 'static', key: `static:${slug}`, group: entry.group || 'static', html: renderStaticUrlCard(slug, entry) });
   }
 
+  // Add daemon cards
+  for (const key of Object.keys(CONFIG.daemons || {})) {
+    const summary = daemonManager.getSummary(key);
+    const entryCfg = CONFIG.entries?.[`daemon:${key}`] || {};
+    items.push({ type: 'daemon', key: `daemon:${key}`, group: entryCfg.group || null, html: renderDaemonCard(key, summary) });
+  }
+
+  // Add cron cards
+  for (const entry of parseCrontab()) {
+    const entryCfg = CONFIG.entries?.[`cron:${entry.id}`] || {};
+    items.push({ type: 'cron', key: `cron:${entry.id}`, group: entryCfg.group || null, html: renderCronCard(entry) });
+  }
+
+  // Add launchd cards
+  for (const agent of listLaunchAgents()) {
+    const entryCfg = CONFIG.entries?.[`launchd:${agent.label}`] || {};
+    items.push({ type: 'launchd', key: `launchd:${agent.label}`, group: entryCfg.group || null, html: renderLaunchdCard(agent) });
+  }
+
   // Sort items by globalOrder
   const order = CONFIG.globalOrder || [];
   items.sort((a, b) => {
@@ -750,6 +1544,19 @@ function renderCardsGrouped(processes) {
   }
   for (const [slug, entry] of Object.entries(staticUrls)) {
     items.push({ key: `static:${slug}`, group: entry.group || 'static', html: renderStaticUrlCard(slug, entry) });
+  }
+  for (const key of Object.keys(CONFIG.daemons || {})) {
+    const summary = daemonManager.getSummary(key);
+    const entryCfg = CONFIG.entries?.[`daemon:${key}`] || {};
+    items.push({ key: `daemon:${key}`, group: entryCfg.group || null, html: renderDaemonCard(key, summary) });
+  }
+  for (const entry of parseCrontab()) {
+    const entryCfg = CONFIG.entries?.[`cron:${entry.id}`] || {};
+    items.push({ key: `cron:${entry.id}`, group: entryCfg.group || null, html: renderCronCard(entry) });
+  }
+  for (const agent of listLaunchAgents()) {
+    const entryCfg = CONFIG.entries?.[`launchd:${agent.label}`] || {};
+    items.push({ key: `launchd:${agent.label}`, group: entryCfg.group || null, html: renderLaunchdCard(agent) });
   }
 
   // Sort items by globalOrder
@@ -810,6 +1617,482 @@ function renderCardsGrouped(processes) {
   }
 
   return html || renderCards([]);
+}
+
+// ── Unified Item Pipeline ──────────────────────────────────────────────────
+//
+// All managed objects (pm2, daemon, cron, launchd, static URL, future: docker,
+// systemd, agent…) are normalized into a single Item shape so the client can
+// filter, sort, group, and render them uniformly.
+//
+// See docs/PIPELINE.md for the full architecture spec.
+//
+// @typedef {Object} Item
+//   id            "<type>:<name>" e.g. "pm2:web", "cron:ab12cd"
+//   type          "pm2"|"static"|"merge"|"daemon"|"cron"|"launchd"
+//   name          Short key (p.name, daemon key, cron hash, launchd label, slug)
+//   title         Human label from config overlay (or null)
+//   icon          Glyph for type tabs + section headers
+//   status        Raw provider status string
+//   statusBucket  "active"|"stopped"|"errored"|"inactive"
+//   group         CONFIG group ID or null
+//   color         User-assigned accent hex or null
+//   order         Index in CONFIG.globalOrder (default 9999)
+//   metrics       { cpu, memoryBytes, memoryHuman, uptimeMs, uptimeHuman, restarts }
+//   meta          Open record; type-specific fields (port, schedule, pid, url, …)
+//   actions       string[] of available action IDs for this item's current state
+
+/** Normalize any provider's raw status → four-way bucket */
+function toStatusBucket(type, rawStatus) {
+  if (type === 'cron')   return (rawStatus === 'active')  ? 'active' : 'inactive';
+  if (type === 'static') return rawStatus === 'ok' ? 'active' : rawStatus === 'error' ? 'errored' : 'inactive';
+  if (['online', 'loaded', 'running', 'active'].includes(rawStatus))          return 'active';
+  if (['errored', 'error', 'failed', 'crash-loop'].includes(rawStatus))       return 'errored';
+  if (['stopping', 'launching', 'restarting', 'pending'].includes(rawStatus)) return 'stopped';
+  return 'stopped';
+}
+
+/** @type {Record<string, {type,icon,label,availableActions,tableColumns,collect,action,detail,logs}>} */
+const ITEM_ADAPTERS = {
+
+  // ── pm2 processes ──────────────────────────────────────────────────────────
+  pm2: {
+    type: 'pm2', icon: '▶', label: 'pm2',
+    availableActions: ['start','stop','restart','reload','delete','logs','detail','signal','scale'],
+    tableColumns: [
+      { id: 'status',   label: '',          align: 'center', width: '2rem'  },
+      { id: 'name',     label: 'name',      sortable: true                  },
+      { id: 'port',     label: 'port',      width: '4.5rem'                 },
+      { id: 'uptime',   label: 'uptime',    sortable: true, width: '5rem'   },
+      { id: 'cpu',      label: 'cpu',       sortable: true, width: '4rem', align: 'right' },
+      { id: 'mem',      label: 'mem',       sortable: true, width: '5rem', align: 'right' },
+      { id: 'restarts', label: 'restarts',  sortable: true, width: '4.5rem', align: 'right' },
+      { id: 'trend',    label: 'trend',     width: '5rem'                   },
+      { id: 'group',    label: 'group',     width: '6rem'                   },
+      { id: 'actions',  label: '',          width: '8rem'                   },
+    ],
+    collect() {
+      const processes = pm2List();
+      const merges     = CONFIG.merges  || {};
+      const entries    = CONFIG.entries || {};
+      const order      = CONFIG.globalOrder || [];
+      const mergedNames = new Set(Object.values(merges).flat());
+      return processes
+        .filter(p => !mergedNames.has(p.name))
+        .map(p => {
+          const s = summarizeProcess(p);
+          const isOnline = s.status === 'online';
+          return {
+            id:           `pm2:${p.name}`,
+            type:         'pm2',
+            name:         p.name,
+            title:        s._title || null,
+            icon:         '▶',
+            status:       s.status,
+            statusBucket: toStatusBucket('pm2', s.status),
+            group:        s._group || null,
+            color:        s._color || null,
+            order:        (() => { const i = order.indexOf(p.name); return i >= 0 ? i : 9999; })(),
+            metrics: {
+              cpu:          s.cpu_percent,
+              memoryBytes:  s.memory_bytes,
+              memoryHuman:  s.memory_human,
+              uptimeMs:     s.uptime_ms,
+              uptimeHuman:  s.uptime_human,
+              restarts:     s.restarts || 0,
+            },
+            meta: {
+              port:    s.port,
+              pid:     s.pid,
+              cwd:     s.cwd,
+              script:  s.script,
+              logOut:  s.log_out,
+              logErr:  s.log_err,
+            },
+            actions: isOnline
+              ? ['restart','reload','stop','logs','detail','signal','scale']
+              : ['start','delete','logs'],
+          };
+        });
+    },
+    action(id, cmd) {
+      const name = id.replace(/^pm2:/, '');
+      const ALLOWED = ['restart','reload','stop','start','delete','flush','reset'];
+      if (!ALLOWED.includes(cmd) || !validateName(name)) return { ok: false, error: 'invalid command or name' };
+      try {
+        execSync(`pm2 ${cmd} ${JSON.stringify(name)}`, { timeout: 15000 });
+        return { ok: true };
+      } catch (e) { return { ok: false, error: e.message }; }
+    },
+    detail(id) {
+      const name = id.replace(/^pm2:/, '');
+      const p = pm2Find(name);
+      return p ? summarizeProcess(p) : null;
+    },
+    logs(id, opts = {}) {
+      const name  = id.replace(/^pm2:/, '');
+      const lines = Math.min(opts.lines || 80, 500);
+      try {
+        return execSync(`pm2 logs ${JSON.stringify(name)} --lines ${lines} --nostream --raw 2>&1`, { encoding: 'utf-8', timeout: 10000 });
+      } catch (e) { return String(e.message || e); }
+    },
+  },
+
+  // ── Merged virtual cards ───────────────────────────────────────────────────
+  merge: {
+    type: 'merge', icon: '⚡', label: 'merge',
+    availableActions: ['restart','logs'],
+    tableColumns: [
+      { id: 'status',  label: '',       align: 'center', width: '2rem'  },
+      { id: 'name',    label: 'name',   sortable: true                  },
+      { id: 'members', label: 'parts',  width: '8rem'                   },
+      { id: 'group',   label: 'group',  width: '6rem'                   },
+      { id: 'actions', label: '',       width: '6rem'                   },
+    ],
+    collect() {
+      const merges  = CONFIG.merges  || {};
+      const entries = CONFIG.entries || {};
+      const order   = CONFIG.globalOrder || [];
+      const allProcs = pm2List();
+      const byName  = {};
+      for (const p of allProcs) byName[p.name] = p;
+      return Object.entries(merges).map(([key, pNames]) => {
+        if (!pNames.some(n => byName[n])) return null;
+        const cfg       = entries[key] || entries[pNames[0]] || {};
+        const liveProcs = pNames.filter(n => byName[n]).map(n => summarizeProcess(byName[n]));
+        const anyOnline = liveProcs.some(p => p.status === 'online');
+        return {
+          id:           `merge:${key}`,
+          type:         'merge',
+          name:         key,
+          title:        cfg.title || key,
+          icon:         '⚡',
+          status:       anyOnline ? 'online' : 'stopped',
+          statusBucket: anyOnline ? 'active' : 'stopped',
+          group:        cfg.group || null,
+          color:        cfg.color || null,
+          order:        (() => { const i = order.indexOf(key); return i >= 0 ? i : 9999; })(),
+          metrics: {
+            cpu: null, memoryBytes: null, memoryHuman: null, uptimeMs: null, uptimeHuman: null,
+            restarts: liveProcs.reduce((s, p) => s + (p.restarts || 0), 0),
+          },
+          meta: { members: pNames },
+          actions: anyOnline ? ['restart','logs'] : ['start'],
+        };
+      }).filter(Boolean);
+    },
+    action(id, cmd) {
+      const key = id.replace(/^merge:/, '');
+      const pNames = (CONFIG.merges || {})[key] || [];
+      try {
+        if (cmd === 'restart') { for (const n of pNames) execSync(`pm2 restart ${JSON.stringify(n)}`, { timeout: 15000 }); }
+        else if (cmd === 'start') { for (const n of pNames) execSync(`pm2 start ${JSON.stringify(n)}`, { timeout: 15000 }); }
+        else return { ok: false, error: `Unknown cmd: ${cmd}` };
+        return { ok: true };
+      } catch (e) { return { ok: false, error: e.message }; }
+    },
+    detail(id) { return { members: (CONFIG.merges || {})[id.replace(/^merge:/, '')] || [] }; },
+    logs(id, opts = {}) {
+      const key = id.replace(/^merge:/, '');
+      const pNames = (CONFIG.merges || {})[key] || [];
+      const lines = Math.min(opts.lines || 80, 500);
+      try {
+        return pNames.map(n =>
+          execSync(`pm2 logs ${JSON.stringify(n)} --lines ${lines} --nostream --raw 2>&1`, { encoding: 'utf-8', timeout: 10000 })
+        ).join('\n');
+      } catch (e) { return String(e.message || e); }
+    },
+  },
+
+  // ── Static URL monitors ────────────────────────────────────────────────────
+  static: {
+    type: 'static', icon: '🔗', label: 'static',
+    availableActions: ['check-health','delete'],
+    tableColumns: [
+      { id: 'status',  label: '',         align: 'center', width: '2rem'  },
+      { id: 'name',    label: 'name',     sortable: true                  },
+      { id: 'url',     label: 'url'                                       },
+      { id: 'health',  label: 'health',   width: '5rem'                   },
+      { id: 'group',   label: 'group',    width: '6rem'                   },
+      { id: 'actions', label: '',         width: '5rem'                   },
+    ],
+    collect() {
+      const staticUrls = CONFIG.staticUrls || {};
+      const order      = CONFIG.globalOrder || [];
+      return Object.entries(staticUrls).map(([slug, u]) => ({
+        id:           `static:${slug}`,
+        type:         'static',
+        name:         slug,
+        title:        u.title || null,
+        icon:         '🔗',
+        status:       'unknown',
+        statusBucket: 'inactive',
+        group:        u.group || null,
+        color:        u.color || null,
+        order:        (() => { const i = order.indexOf(`static:${slug}`); return i >= 0 ? i : 9999; })(),
+        metrics: { cpu: null, memoryBytes: null, memoryHuman: null, uptimeMs: null, uptimeHuman: null, restarts: 0 },
+        meta: { url: u.url || null },
+        actions: ['check-health','delete'],
+      }));
+    },
+    action(id, cmd) {
+      const slug = id.replace(/^static:/, '');
+      if (cmd === 'delete') {
+        const staticUrls = CONFIG.staticUrls || {};
+        delete staticUrls[slug];
+        CONFIG.staticUrls = staticUrls;
+        saveConfig();
+        return { ok: true };
+      }
+      return { ok: false, error: `Use GET /api/static-urls/${encodeURIComponent(slug)}/health for check-health` };
+    },
+    detail(id) { return (CONFIG.staticUrls || {})[id.replace(/^static:/, '')] || null; },
+    logs() { return '(static URLs have no logs)'; },
+  },
+
+  // ── Custom daemons ─────────────────────────────────────────────────────────
+  daemon: {
+    type: 'daemon', icon: '⚙', label: 'Daemon',
+    availableActions: ['start','stop','restart','delete','logs','detail','flush-logs'],
+    tableColumns: [
+      { id: 'status',   label: '',         align: 'center', width: '2rem'  },
+      { id: 'name',     label: 'name',     sortable: true                  },
+      { id: 'pid',      label: 'pid',      width: '4rem', align: 'right'   },
+      { id: 'uptime',   label: 'uptime',   sortable: true, width: '5rem'   },
+      { id: 'cpu',      label: 'cpu',      sortable: true, width: '4rem', align: 'right' },
+      { id: 'mem',      label: 'mem',      sortable: true, width: '5rem', align: 'right' },
+      { id: 'restarts', label: 'restarts', sortable: true, width: '4.5rem', align: 'right' },
+      { id: 'group',    label: 'group',    width: '6rem'                   },
+      { id: 'actions',  label: '',         width: '7rem'                   },
+    ],
+    collect() {
+      const order = CONFIG.globalOrder || [];
+      return Object.keys(CONFIG.daemons || {}).map(key => {
+        const s = daemonManager.getSummary(key);
+        const isOnline = s.status === 'online';
+        return {
+          id:           `daemon:${key}`,
+          type:         'daemon',
+          name:         key,
+          title:        s._title || null,
+          icon:         '⚙',
+          status:       s.status,
+          statusBucket: toStatusBucket('daemon', s.status),
+          group:        s._group || null,
+          color:        s._color || null,
+          order:        (() => { const i = order.indexOf(`daemon:${key}`); return i >= 0 ? i : 9999; })(),
+          metrics: {
+            cpu:         s.cpu_percent,
+            memoryBytes: s.memory_bytes,
+            memoryHuman: s.memory_human,
+            uptimeMs:    s.uptime_ms,
+            uptimeHuman: s.uptime_human,
+            restarts:    s.restarts || 0,
+          },
+          meta: {
+            pid:     s.pid,
+            command: s.command,
+            cwd:     s.workdir,
+            logOut:  s.logFile,
+            logErr:  s.errFile,
+          },
+          actions: isOnline
+            ? ['stop','restart','logs','detail','flush-logs']
+            : ['start','delete','logs','detail'],
+        };
+      });
+    },
+    action(id, cmd) {
+      const key = id.replace(/^daemon:/, '');
+      if (!CONFIG.daemons?.[key]) return { ok: false, error: 'Daemon not found' };
+      try {
+        if (cmd === 'start')       { daemonManager.start(key); }
+        else if (cmd === 'stop')   { return Promise.resolve(daemonManager.stop(key)).then(() => ({ ok: true })); }
+        else if (cmd === 'restart') { return Promise.resolve(daemonManager.restart(key)).then(() => ({ ok: true })); }
+        else if (cmd === 'flush-logs') { daemonManager.flushLogs(key); }
+        else if (cmd === 'delete') {
+          daemonManager.stop(key).catch(() => {});
+          delete CONFIG.daemons[key];
+          saveConfig();
+        }
+        else return { ok: false, error: `Unknown cmd: ${cmd}` };
+        return { ok: true };
+      } catch (e) { return { ok: false, error: String(e) }; }
+    },
+    detail(id) {
+      const key = id.replace(/^daemon:/, '');
+      if (!CONFIG.daemons?.[key]) return null;
+      return daemonManager.getSummary(key);
+    },
+    logs(id, opts = {}) {
+      const key = id.replace(/^daemon:/, '');
+      const cfg = CONFIG.daemons?.[key];
+      if (!cfg) return '(daemon not found)';
+      const lines = Math.min(opts.lines || 80, 500);
+      const stream = opts.stream || 'out';
+      const { logFile, errFile } = daemonLogPaths(key, cfg);
+      const file = stream === 'err' ? errFile : logFile;
+      try {
+        return execSync(`tail -n ${lines} ${JSON.stringify(file)} 2>/dev/null || echo "(no logs yet)"`, { encoding: 'utf-8', timeout: 5000 });
+      } catch (e) { return String(e.message || e); }
+    },
+  },
+
+  // ── Cron jobs ──────────────────────────────────────────────────────────────
+  cron: {
+    type: 'cron', icon: '⏱', label: 'Cron',
+    availableActions: ['enable','disable','run-now','detail'],
+    tableColumns: [
+      { id: 'status',   label: '',          align: 'center', width: '2rem'  },
+      { id: 'name',     label: 'name / id', sortable: true                  },
+      { id: 'schedule', label: 'schedule',  width: '10rem'                  },
+      { id: 'next',     label: 'next run',  sortable: true, width: '7rem'   },
+      { id: 'command',  label: 'command'                                    },
+      { id: 'group',    label: 'group',     width: '6rem'                   },
+      { id: 'actions',  label: '',          width: '6rem'                   },
+    ],
+    collect() {
+      const order = CONFIG.globalOrder || [];
+      return parseCrontab().map(e => ({
+        id:           `cron:${e.id}`,
+        type:         'cron',
+        name:         e.id,
+        title:        e._title || null,
+        icon:         '⏱',
+        status:       e.enabled ? 'active' : 'inactive',
+        statusBucket: e.enabled ? 'active' : 'inactive',
+        group:        e._group || null,
+        color:        e._color || null,
+        order:        (() => { const i = order.indexOf(`cron:${e.id}`); return i >= 0 ? i : 9999; })(),
+        metrics: { cpu: null, memoryBytes: null, memoryHuman: null, uptimeMs: null, uptimeHuman: null, restarts: 0 },
+        meta: {
+          command:     e.command,
+          schedule:    e.humanSchedule,
+          scheduleRaw: e.schedule,
+          nextRunMs:   e.nextRunMs,
+          enabled:     e.enabled,
+        },
+        actions: ['detail', 'run-now', ...(e.enabled ? ['disable'] : ['enable'])],
+      }));
+    },
+    action(id, cmd) {
+      const cronId = id.replace(/^cron:/, '');
+      const entry = parseCrontab().find(e => e.id === cronId);
+      if (!entry) return { ok: false, error: 'Cron entry not found' };
+      try {
+        if (cmd === 'enable')   setCronEnabled(cronId, true);
+        else if (cmd === 'disable') setCronEnabled(cronId, false);
+        else if (cmd === 'run-now') {
+          const tokens = entry.command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
+          const prog = tokens[0], args = tokens.slice(1).map(t => t.replace(/^['"]|['"]$/g, ''));
+          const child = spawn(prog, args, { detached: true, stdio: 'ignore', shell: false });
+          child.unref();
+        } else return { ok: false, error: `Unknown cmd: ${cmd}` };
+        return { ok: true };
+      } catch (e) { return { ok: false, error: String(e) }; }
+    },
+    detail(id) {
+      const cronId = id.replace(/^cron:/, '');
+      return parseCrontab().find(e => e.id === cronId) || null;
+    },
+    logs() { return '(cron jobs do not have managed log files)'; },
+  },
+
+  // ── LaunchD agents (macOS) ─────────────────────────────────────────────────
+  launchd: {
+    type: 'launchd', icon: '⌘', label: 'LaunchD',
+    availableActions: ['load','unload','kickstart','stop','logs','detail'],
+    tableColumns: [
+      { id: 'status',   label: '',          align: 'center', width: '2rem'  },
+      { id: 'name',     label: 'label',     sortable: true                  },
+      { id: 'schedule', label: 'schedule',  width: '10rem'                  },
+      { id: 'pid',      label: 'pid',       width: '4rem', align: 'right'   },
+      { id: 'exit',     label: 'last exit', width: '5rem', align: 'right'   },
+      { id: 'plist',    label: 'plist',     width: '14rem'                  },
+      { id: 'group',    label: 'group',     width: '6rem'                   },
+      { id: 'actions',  label: '',          width: '7rem'                   },
+    ],
+    collect() {
+      const order = CONFIG.globalOrder || [];
+      return listLaunchAgents().map(a => {
+        const schedStr = a.schedule
+          ? (typeof a.schedule === 'string' ? a.schedule : JSON.stringify(a.schedule))
+          : null;
+        return {
+          id:           `launchd:${a.label}`,
+          type:         'launchd',
+          name:         a.label,
+          title:        a._title || null,
+          icon:         '⌘',
+          status:       a.status,
+          statusBucket: toStatusBucket('launchd', a.status),
+          group:        a._group || null,
+          color:        a._color || null,
+          order:        (() => { const i = order.indexOf(`launchd:${a.label}`); return i >= 0 ? i : 9999; })(),
+          metrics: { cpu: null, memoryBytes: null, memoryHuman: null, uptimeMs: null, uptimeHuman: null, restarts: 0 },
+          meta: {
+            pid:            a.pid,
+            command:        a.command,
+            schedule:       schedStr,
+            plistPath:      a.plistPath,
+            loaded:         a.loaded,
+            lastExitStatus: a.lastExitStatus,
+            runAtLoad:      a.runAtLoad,
+            keepAlive:      a.keepAlive,
+            logOut:         a.stdoutPath,
+            logErr:         a.stderrPath,
+          },
+          actions: a.loaded
+            ? ['stop','kickstart','logs','detail','unload']
+            : ['load','detail'],
+        };
+      });
+    },
+    action(id, cmd) {
+      const label = id.replace(/^launchd:/, '');
+      const agent = listLaunchAgents().find(a => a.label === label);
+      if (!agent) return { ok: false, error: 'Agent not found' };
+      const allowed = ['load','unload','kickstart','stop'];
+      if (!allowed.includes(cmd)) return { ok: false, error: `Unknown cmd: ${cmd}` };
+      try { doLaunchctl(cmd, agent.label, agent.plistPath); return { ok: true }; }
+      catch (e) { return { ok: false, error: String(e) }; }
+    },
+    detail(id) {
+      const label = id.replace(/^launchd:/, '');
+      invalidateLaunchdCache();
+      return listLaunchAgents().find(a => a.label === label) || null;
+    },
+    logs(id, opts = {}) {
+      const label = id.replace(/^launchd:/, '');
+      const agent = listLaunchAgents().find(a => a.label === label);
+      if (!agent) return '(agent not found)';
+      const logPath = opts.stream === 'err' ? agent.stderrPath : agent.stdoutPath;
+      if (!logPath) return '(no log path configured)';
+      try {
+        const lines = Math.min(opts.lines || 80, 500);
+        return execSync(`tail -n ${lines} ${JSON.stringify(logPath)} 2>/dev/null || echo "(no logs yet)"`, { encoding: 'utf-8', timeout: 5000 });
+      } catch (e) { return String(e.message || e); }
+    },
+  },
+};
+
+/**
+ * Aggregate all items from every adapter into one sorted Item[].
+ * Adapters are called in insertion order of ITEM_ADAPTERS.
+ * A failing adapter logs an error and contributes [] — never crashes the poll.
+ */
+function aggregateItems() {
+  const order = CONFIG.globalOrder || [];
+  const items = [];
+  for (const adapter of Object.values(ITEM_ADAPTERS)) {
+    try {
+      items.push(...adapter.collect());
+    } catch (e) {
+      console.error(`[aggregateItems] ${adapter.type}.collect() failed:`, e.message);
+    }
+  }
+  items.sort((a, b) => (a.order ?? 9999) - (b.order ?? 9999));
+  return items;
 }
 
 // ── Theme definitions (from template library) ─────────────────────────────
@@ -1350,6 +2633,7 @@ function renderPage(processes) {
     .status-dot.online    { background: var(--green); }
     .status-dot.stopped   { background: var(--text-faint); }
     .status-dot.errored   { background: var(--danger); }
+    .status-dot.scheduled { background: #58a6ff; }
     .status-dot.launching { background: var(--warning); }
     .status-pulse {
       animation: status-pulse 1.4s ease-in-out infinite;
@@ -1382,7 +2666,27 @@ function renderPage(processes) {
     .badge.online    { background: var(--green-bg);   color: var(--green);   border: 1px solid var(--green); }
     .badge.stopped   { background: var(--bg-inset);   color: var(--text-faint); border: 1px solid var(--border); }
     .badge.errored   { background: var(--danger-bg);  color: var(--danger);  border: 1px solid var(--danger); }
-    .badge.launching { background: var(--warning-bg); color: var(--warning); border: 1px solid var(--warning); }
+    .badge.launching  { background: var(--warning-bg); color: var(--warning); border: 1px solid var(--warning); }
+    .badge.scheduled  { background: #0d1f3c; color: #58a6ff; border: 1px solid #1f4080; }
+
+    /* ── Type badge (daemon / cron / launchd pill) ─────────────────────── */
+    .type-badge {
+      font-size: 0.55rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      padding: 1px 5px;
+      border-radius: 3px;
+      margin-left: 4px;
+      vertical-align: middle;
+      flex-shrink: 0;
+    }
+    .type-badge--daemon  { background: #1a3a6e; color: #79c0ff; border: 1px solid #2a5299; }
+    .type-badge--cron    { background: #3a2a00; color: #f0a050; border: 1px solid #6a4a00; }
+    .type-badge--launchd { background: #2a1a3a; color: #c09aff; border: 1px solid #4a2a6a; }
+
+    /* ── Proc icon (emoji displayed before name in daemon cards) ──────── */
+    .proc-icon { font-size: 0.85rem; line-height: 1; margin-right: 1px; flex-shrink: 0; }
 
     /* ── Card body ──────────────────────────────────────────────────────── */
     .card-body { padding: 0.625rem 0.875rem 0.5rem; }
@@ -1521,10 +2825,12 @@ function renderPage(processes) {
       flex-direction: column;
       animation: modal-in 0.18s ease;
     }
+    .modal-detail { width: min(640px, 100%); }
     @keyframes modal-in {
       from { opacity: 0; transform: scale(0.97) translateY(8px); }
       to   { opacity: 1; transform: scale(1) translateY(0); }
     }
+    @keyframes spin { to { transform: rotate(360deg); } }
 
     .modal-header {
       display: flex;
@@ -1538,6 +2844,25 @@ function renderPage(processes) {
     .modal-header h2 { font-size: 1rem; margin: 0; color: var(--text-primary); font-weight: 600; }
     .modal-title { font-size: 0.85rem; color: var(--text-secondary); }
     .modal-title strong { color: var(--text-primary); }
+
+    .modal-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 0.875rem 1.25rem;
+      font-size: 0.8rem;
+      line-height: 1.6;
+      background: var(--bg-inset);
+    }
+    .modal-footer {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 0.5rem;
+      padding: 0.625rem 1.25rem;
+      border-top: 1px solid var(--border);
+      background: var(--bg-tertiary);
+      flex-shrink: 0;
+    }
 
     .modal-close {
       background: none; border: none;
@@ -1886,6 +3211,26 @@ function renderPage(processes) {
 
     /* ── Process table view ─────────────────────────────────────────────── */
     .process-table-wrap { overflow-x: auto; }
+    #table-sections { display: flex; flex-direction: column; gap: 1.25rem; }
+    .table-section { border: 1px solid var(--border-subtle); border-radius: 6px; overflow: hidden; }
+    .table-section-header {
+      display: flex; align-items: center; gap: 0.4rem;
+      padding: 5px 10px;
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border-subtle);
+      font-size: 0.68rem; color: var(--text-secondary);
+      user-select: none;
+    }
+    .table-section-header .type-icon { font-size: 0.8rem; }
+    .table-section-header .type-label { font-weight: 600; color: var(--text); }
+    .table-section-header .type-count { color: var(--text-faint); }
+    .tbl-sort-btn {
+      background: none; border: none; padding: 0; cursor: pointer;
+      font: inherit; color: inherit; text-align: inherit;
+    }
+    .tbl-sort-btn:hover { color: var(--accent); }
+    .tbl-sort-btn.sorted-asc::after  { content: ' ▲'; color: var(--accent); }
+    .tbl-sort-btn.sorted-desc::after { content: ' ▼'; color: var(--accent); }
     .process-table {
       width: 100%;
       border-collapse: collapse;
@@ -1961,6 +3306,97 @@ function renderPage(processes) {
       background: var(--bg-tertiary); opacity: 0.9; flex-shrink: 0;
     }
     .stat-pill-sep { width: 1px; height: 12px; background: var(--border); margin: 0 0.25rem; }
+
+    /* ── Filter bar ─────────────────────────────────────────────────────── */
+    .filter-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      margin: -1.5rem -2rem 1.5rem;
+      padding: 5px 2rem;
+      background: var(--bg-inset);
+      border-bottom: 1px solid var(--border-subtle);
+      flex-wrap: wrap;
+    }
+    .type-tabs, .status-tabs { display: flex; align-items: center; gap: 2px; }
+    .type-tab, .status-tab {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 0.7rem;
+      font-family: inherit;
+      padding: 3px 9px;
+      background: transparent;
+      color: var(--text-faint);
+      border: 1px solid transparent;
+      border-radius: 100px;
+      cursor: pointer;
+      transition: color 0.12s, background 0.12s, border-color 0.12s, opacity 0.12s;
+      white-space: nowrap;
+      line-height: 1.6;
+      user-select: none;
+    }
+    .tab-icon { font-size: 0.82rem; opacity: 0.7; flex-shrink: 0; }
+    .tab-count {
+      font-size: 0.58rem;
+      padding: 0 4px;
+      min-width: 16px;
+      text-align: center;
+      line-height: 1.6;
+      background: var(--bg-tertiary);
+      border-radius: 100px;
+      color: var(--text-faint);
+      transition: background 0.12s, color 0.12s;
+    }
+    /* Per-tab color tokens — shared by hover + active */
+    .type-tab[data-filter-type="all"]     { --tc: var(--text-secondary); --tbg: var(--bg-tertiary); }
+    .type-tab[data-filter-type="server"]  { --tc: var(--green);   --tbg: var(--green-bg); }
+    .type-tab[data-filter-type="daemon"]  { --tc: var(--warning); --tbg: var(--warning-bg); }
+    .type-tab[data-filter-type="cron"]    { --tc: var(--accent);  --tbg: var(--accent-bg); }
+    .type-tab[data-filter-type="launchd"] { --tc: var(--danger);  --tbg: var(--danger-bg); }
+    .status-tab[data-filter-status="all"]     { --tc: var(--text-secondary); --tbg: var(--bg-tertiary); }
+    .status-tab[data-filter-status="online"]  { --tc: var(--green);   --tbg: var(--green-bg); }
+    .status-tab[data-filter-status="stopped"] { --tc: var(--text-muted); --tbg: var(--bg-tertiary); }
+    .status-tab[data-filter-status="errored"] { --tc: var(--danger);  --tbg: var(--danger-bg); }
+    /* Hover: color hint at reduced opacity */
+    .type-tab:hover, .status-tab:hover {
+      color: var(--tc);
+      background: var(--tbg);
+      border-color: var(--tc);
+      opacity: 0.75;
+    }
+    /* Active: full color */
+    .type-tab.active, .status-tab.active {
+      color: var(--tc);
+      background: var(--tbg);
+      border-color: var(--tc);
+      opacity: 1;
+    }
+    .type-tab.active .tab-count, .status-tab.active .tab-count {
+      background: rgba(255,255,255,0.12);
+      color: var(--tc);
+    }
+    .filter-tools { display: flex; align-items: center; gap: 0.5rem; }
+    .filter-sep { width: 1px; height: 16px; background: var(--border); margin: 0 0.2rem; }
+    .sort-select {
+      font-size: 0.7rem;
+      font-family: inherit;
+      background: var(--bg-secondary);
+      color: var(--text-muted);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 3px 8px;
+      cursor: pointer;
+      outline: none;
+      transition: border-color 0.12s;
+    }
+    .sort-select:hover { border-color: var(--text-muted); color: var(--text-secondary); }
+    @media (max-width: 600px) {
+      .filter-bar { flex-direction: column; align-items: flex-start; gap: 0.4rem; }
+      .type-tabs, .status-tabs { flex-wrap: wrap; }
+      .filter-tools { flex-wrap: wrap; gap: 0.35rem; }
+    }
 
     /* ── Advanced card actions ──────────────────────────────────────────── */
     .card-actions-adv {
@@ -2302,11 +3738,15 @@ function renderPage(processes) {
       .card-actions { padding: 0.25rem 0.75rem; }
       .btn { font-size: 0.65rem; padding: 3px 7px; }
       .modal { width: 100%; border-radius: 0; max-height: 95vh; }
+      .modal-detail { width: 100%; }
       .modal-header { padding: 0.5rem 0.75rem; }
+      .modal-body { padding: 0.625rem 0.875rem; }
+      .modal-footer { padding: 0.5rem 0.875rem; }
       .config-tabs { padding: 0 0.75rem; }
       #config-tab-content { padding: 0.25rem 0.75rem 0.75rem; }
       .process-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
       .group-actions { display: none; }
+      .tab-icon { font-size: 0.75rem; }
     }
   </style>
 </head>
@@ -2359,27 +3799,147 @@ function renderPage(processes) {
     </div>
   </div>
 
+  <div class="filter-bar" id="filter-bar">
+    <div class="type-tabs" id="type-tabs" title="Shift-click to select multiple">
+      <button class="type-tab active" data-filter-type="all"     onclick="setTypeFilter('all',event)"><span class="tab-icon">⬡</span>All<span class="tab-count" id="tc-all"></span></button>
+      <button class="type-tab"        data-filter-type="server"  onclick="setTypeFilter('server',event)"><span class="tab-icon">▶</span>pm2<span class="tab-count" id="tc-server"></span></button>
+      <button class="type-tab"        data-filter-type="daemon"  onclick="setTypeFilter('daemon',event)"><span class="tab-icon">⚙</span>Daemon<span class="tab-count" id="tc-daemon"></span></button>
+      <button class="type-tab"        data-filter-type="cron"    onclick="setTypeFilter('cron',event)"><span class="tab-icon">⏱</span>Cron<span class="tab-count" id="tc-cron"></span></button>
+      <button class="type-tab"        data-filter-type="launchd" onclick="setTypeFilter('launchd',event)"><span class="tab-icon">⌘</span>LaunchD<span class="tab-count" id="tc-launchd"></span></button>
+    </div>
+    <div class="filter-tools">
+      <div class="status-tabs" id="status-tabs" title="Shift-click to select multiple">
+        <button class="status-tab active" data-filter-status="all"     onclick="setStatusFilter('all',event)"><span class="tab-icon">∗</span>All<span class="tab-count" id="sc-all"></span></button>
+        <button class="status-tab"        data-filter-status="online"  onclick="setStatusFilter('online',event)"><span class="tab-icon">●</span>Active<span class="tab-count" id="sc-online"></span></button>
+        <button class="status-tab"        data-filter-status="stopped" onclick="setStatusFilter('stopped',event)"><span class="tab-icon">○</span>Stopped<span class="tab-count" id="sc-stopped"></span></button>
+        <button class="status-tab"        data-filter-status="errored" onclick="setStatusFilter('errored',event)"><span class="tab-icon">⚠</span>Errored<span class="tab-count" id="sc-errored"></span></button>
+      </div>
+      <div class="filter-sep"></div>
+      <select class="sort-select" id="sort-select" onchange="setSortOrder(this.value)" title="Sort visible cards">
+        <option value="">sort…</option>
+        <option value="name-asc">Name A→Z</option>
+        <option value="name-desc">Name Z→A</option>
+        <option value="status">Status</option>
+        <option value="type">Type</option>
+        <option value="restarts-desc">Restarts ↓</option>
+      </select>
+    </div>
+  </div>
+
   <div class="grid" id="grid">
     ${cards}
   </div>
 
   <div class="process-table-wrap" id="table-wrap" style="display:none">
-    <table class="process-table" id="process-table">
-      <thead>
-        <tr>
-          <th></th><th>status</th><th>name</th><th>id</th><th>port</th>
-          <th>uptime</th><th>cpu</th><th>mem</th><th>restarts</th>
-          <th>trend</th><th>group</th><th>actions</th>
-        </tr>
-      </thead>
-      <tbody id="table-body"></tbody>
-    </table>
+    <div id="table-sections"></div>
   </div>
 
   <!-- Theme picker panel -->
   <div class="theme-panel" id="theme-panel">
     <div class="theme-panel-title">Color Theme</div>
     <div class="theme-grid" id="theme-grid"></div>
+  </div>
+
+  <!-- LaunchD detail modal -->
+  <div class="backdrop" id="launchd-detail-modal">
+    <div class="modal modal-detail">
+      <div class="modal-header">
+        <span class="modal-title">⚙️ LaunchAgent — <strong id="launchd-detail-name"></strong></span>
+        <button class="modal-close" onclick="closeModal('launchd-detail-modal')">✕</button>
+      </div>
+      <div class="modal-body" id="launchd-detail-body"></div>
+      <div class="modal-footer">
+        <button class="btn" onclick="closeModal('launchd-detail-modal')">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Cron detail modal -->
+  <div class="backdrop" id="cron-detail-modal">
+    <div class="modal modal-detail">
+      <div class="modal-header">
+        <span class="modal-title">🕐 Cron Job — <strong id="cron-detail-name"></strong></span>
+        <button class="modal-close" onclick="closeModal('cron-detail-modal')">✕</button>
+      </div>
+      <div class="modal-body" id="cron-detail-body"></div>
+      <div class="modal-footer">
+        <button class="btn" onclick="closeModal('cron-detail-modal')">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Daemon log modal -->
+  <div class="backdrop" id="daemon-log-modal">
+    <div class="modal">
+      <div class="modal-header">
+        <span class="modal-title">🔧 Daemon Logs — <strong id="daemon-log-name"></strong></span>
+        <button class="modal-close" onclick="closeModal('daemon-log-modal')">✕</button>
+      </div>
+      <div class="log-controls">
+        <button class="btn" id="daemon-log-tab-out" onclick="setDaemonLogTab('out')" style="padding:2px 8px">stdout</button>
+        <button class="btn" id="daemon-log-tab-err" onclick="setDaemonLogTab('err')" style="padding:2px 8px;opacity:0.5">stderr</button>
+        <span class="log-controls-label" style="margin-left:4px">lines</span>
+        <input class="log-lines-input" id="daemon-log-lines" type="number" value="80" min="10" max="500">
+        <button class="btn" onclick="fetchDaemonLogs(currentDaemonLogKey,currentDaemonLogTab)" style="padding:2px 8px">↻ Refresh</button>
+      </div>
+      <div class="log-output" id="daemon-log-output">Loading…</div>
+    </div>
+  </div>
+
+  <!-- Daemon info modal -->
+  <div class="backdrop" id="daemon-info-modal">
+    <div class="modal">
+      <div class="modal-header">
+        <span class="modal-title">🔧 Daemon Info — <strong id="daemon-info-name"></strong></span>
+        <button class="modal-close" onclick="closeModal('daemon-info-modal')">✕</button>
+      </div>
+      <div class="info-body" id="daemon-info-body">Loading…</div>
+    </div>
+  </div>
+
+  <!-- Daemon create modal -->
+  <div class="backdrop" id="daemon-create-modal">
+    <div class="modal" style="max-width:560px">
+      <div class="modal-header">
+        <span class="modal-title">🔧 Register Daemon</span>
+        <button class="modal-close" onclick="closeModal('daemon-create-modal')">✕</button>
+      </div>
+      <div style="padding:1rem">
+        <div style="display:grid;gap:0.75rem">
+          <div>
+            <label style="font-size:0.75rem;color:var(--text-muted);display:block;margin-bottom:3px">Key (alphanumeric, hyphens, underscores)</label>
+            <input id="dc-key" class="adv-input" type="text" placeholder="my-script" style="width:100%;box-sizing:border-box">
+          </div>
+          <div>
+            <label style="font-size:0.75rem;color:var(--text-muted);display:block;margin-bottom:3px">Command</label>
+            <input id="dc-command" class="adv-input" type="text" placeholder="python3 /path/to/script.py --flag" style="width:100%;box-sizing:border-box">
+          </div>
+          <div>
+            <label style="font-size:0.75rem;color:var(--text-muted);display:block;margin-bottom:3px">Working directory</label>
+            <input id="dc-workdir" class="adv-input" type="text" placeholder="${os.homedir()}" style="width:100%;box-sizing:border-box">
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem">
+            <div>
+              <label style="font-size:0.75rem;color:var(--text-muted);display:block;margin-bottom:3px">Auto-restart on crash</label>
+              <select id="dc-autorestart" class="adv-select" style="width:100%">
+                <option value="false">No</option>
+                <option value="true">Yes</option>
+              </select>
+            </div>
+            <div>
+              <label style="font-size:0.75rem;color:var(--text-muted);display:block;margin-bottom:3px">Max restarts</label>
+              <input id="dc-maxrestarts" class="adv-input" type="number" value="5" min="0" max="100" style="width:100%;box-sizing:border-box">
+            </div>
+          </div>
+          <div style="display:flex;gap:0.5rem;margin-top:0.25rem">
+            <button class="btn btn-ok" onclick="submitCreateDaemon(false)" style="flex:1">Register</button>
+            <button class="btn btn-ok" onclick="submitCreateDaemon(true)" style="flex:1">Register &amp; Start</button>
+            <button class="btn" onclick="closeModal('daemon-create-modal')" style="flex:0.5">Cancel</button>
+          </div>
+          <div id="dc-error" style="color:var(--danger);font-size:0.75rem;display:none"></div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- Log modal -->
@@ -2653,7 +4213,8 @@ function renderPage(processes) {
 
     // ── Refresh ────────────────────────────────────────────────────────────
     let firstLoad = true;
-    let lastProcesses = []; // used by table view
+    let lastProcesses = []; // pm2-only summary list (table render, sparklines patch)
+    let allItems      = []; // unified Item[] from aggregateItems() — all types
     let lastMetrics = null; // used to redraw sparklines on view toggle
     let lastHealthMetrics = null; // used to redraw health sparklines on view toggle
     let _lastGroupView = null; // track view mode to detect full-rebuild needs
@@ -2738,19 +4299,18 @@ function renderPage(processes) {
         if (data.stats)    updateStatsBar(data.stats);
         if (data.metrics) { lastMetrics = data.metrics; drawSparklines(data.metrics); }
         if (data.healthMetrics) { lastHealthMetrics = data.healthMetrics; drawHealthSparklines(data.healthMetrics); }
-        if (data.processes) {
-          lastProcesses = data.processes;
-          if (currentView === 'table') {
-            renderTable(lastProcesses);
-            // Re-draw sparklines after table rebuild creates new canvas elements
-            if (data.metrics) drawSparklines(data.metrics);
-            if (lastHealthMetrics) drawHealthSparklines(lastHealthMetrics);
-          }
+        if (data.items)     allItems = data.items;        // all-type pipeline
+        if (data.processes) lastProcesses = data.processes;
+        if (currentView === 'table') {
+          if (allItems.length) renderTableFromItems(allItems);
+          else if (lastProcesses.length) renderTable(lastProcesses);
+          // Re-draw sparklines after table rebuild creates new canvas elements
+          if (data.metrics) drawSparklines(data.metrics);
+          if (lastHealthMetrics) drawHealthSparklines(lastHealthMetrics);
         }
 
-        // Re-apply active search filter
-        const q = document.getElementById('search-input').value.trim();
-        if (q) applySearch(q);
+        // Re-apply all active filters (type, status, search, sort)
+        applyFilters();
 
         firstLoad = false;
       } catch {}
@@ -2949,32 +4509,212 @@ function renderPage(processes) {
       });
     }
 
-    // ── Search ─────────────────────────────────────────────────────────────
-    function applySearch(q) {
-      const term = q.toLowerCase();
-      document.querySelectorAll('.card[data-name]').forEach((card) => {
-        card.style.display = (!term || card.dataset.name.toLowerCase().includes(term)) ? '' : 'none';
+    // ── Filters (type, status, search, sort) ──────────────────────────────
+
+    // State is a Set to support shift-click multi-select.
+    // localStorage stores JSON arrays; plain strings (legacy) are tolerated.
+    function _loadFilterSet(key, def) {
+      try {
+        const v = localStorage.getItem(key);
+        if (!v) return new Set(def);
+        const p = JSON.parse(v);
+        return new Set(Array.isArray(p) ? p : [p]);
+      } catch { return new Set(def); }
+    }
+    let activeTypeFilter   = _loadFilterSet('pm2-type-filter',   ['all']);
+    let activeStatusFilter = _loadFilterSet('pm2-status-filter', ['all']);
+    let activeSortOrder    = localStorage.getItem('pm2-sort-order') || '';
+
+    function _saveFilterSet(key, set) {
+      localStorage.setItem(key, JSON.stringify([...set]));
+    }
+
+    function _syncTabActive(selector, activeSet) {
+      document.querySelectorAll(selector).forEach(t => {
+        const v = t.dataset.filterType || t.dataset.filterStatus;
+        t.classList.toggle('active', activeSet.has(v));
       });
-      // Hide group sections where all children are hidden
+    }
+
+    function setTypeFilter(type, event) {
+      if (event && event.shiftKey && type !== 'all') {
+        activeTypeFilter.delete('all');
+        if (activeTypeFilter.has(type)) activeTypeFilter.delete(type);
+        else activeTypeFilter.add(type);
+        if (activeTypeFilter.size === 0) activeTypeFilter.add('all');
+      } else {
+        activeTypeFilter = new Set([type]);
+      }
+      _saveFilterSet('pm2-type-filter', activeTypeFilter);
+      _syncTabActive('.type-tab', activeTypeFilter);
+      applyFilters();
+    }
+
+    function setStatusFilter(status, event) {
+      if (event && event.shiftKey && status !== 'all') {
+        activeStatusFilter.delete('all');
+        if (activeStatusFilter.has(status)) activeStatusFilter.delete(status);
+        else activeStatusFilter.add(status);
+        if (activeStatusFilter.size === 0) activeStatusFilter.add('all');
+      } else {
+        activeStatusFilter = new Set([status]);
+      }
+      _saveFilterSet('pm2-status-filter', activeStatusFilter);
+      _syncTabActive('.status-tab', activeStatusFilter);
+      applyFilters();
+    }
+
+    function setSortOrder(order) {
+      activeSortOrder = order;
+      localStorage.setItem('pm2-sort-order', order);
+      applyFilters();
+    }
+
+    // Normalize diverse status values to a comparable bucket
+    function _normStatus(status) {
+      if (status === 'scheduled') return 'online'; // cron "active"
+      if (status === 'loaded')    return 'online'; // launchd loaded
+      return status || '';
+    }
+
+    function applyFilters() {
+      const term = document.getElementById('search-input').value.trim().toLowerCase();
+
+      document.querySelectorAll('.card[data-name]').forEach((card) => {
+        const name   = card.dataset.name.toLowerCase();
+        const type   = card.dataset.type || 'server';
+        const status = _normStatus(card.dataset.status);
+
+        const typeMatch =
+          activeTypeFilter.has('all') ||
+          activeTypeFilter.has(type) ||
+          (activeTypeFilter.has('server') && (type === 'server' || type === 'static'));
+
+        const statusMatch =
+          activeStatusFilter.has('all') ||
+          activeStatusFilter.has(status);
+
+        const searchMatch = !term || name.includes(term);
+
+        card.style.display = (typeMatch && statusMatch && searchMatch) ? '' : 'none';
+      });
+
+      // Hide group sections where all visible children are hidden
       document.querySelectorAll('.group-section').forEach((section) => {
         const visibleCards = section.querySelectorAll('.card[data-name]:not([style*="display: none"])');
-        section.style.display = (!term || visibleCards.length > 0) ? '' : 'none';
+        section.style.display = visibleCards.length > 0 ? '' : 'none';
       });
+
+      _updateFilterCounts();
+      if (activeSortOrder) _applySortOrder();
+
       if (currentView === 'table') {
-        document.querySelectorAll('#table-body tr[data-name]').forEach((row) => {
-          row.style.display = (!term || row.dataset.name.toLowerCase().includes(term)) ? '' : 'none';
-        });
-        // Hide table group headers where all children are hidden
-        document.querySelectorAll('.tbl-group-header').forEach((header) => {
-          var next = header.nextElementSibling;
-          var anyVisible = false;
-          while (next && !next.classList.contains('tbl-group-header')) {
-            if (next.style.display !== 'none') anyVisible = true;
-            next = next.nextElementSibling;
-          }
-          header.style.display = (!term || anyVisible) ? '' : 'none';
+        document.querySelectorAll('.table-section').forEach((section) => {
+          const sType = section.dataset.type;
+          const filterKey = _itemTypeToFilterKey(sType);
+          const typeMatch = activeTypeFilter.has('all') || activeTypeFilter.has(filterKey);
+          if (!typeMatch) { section.style.display = 'none'; return; }
+
+          let anyVisible = false;
+          section.querySelectorAll('tr[data-status]').forEach((row) => {
+            const rowStatus = row.dataset.status; // statusBucket
+            const rowId = (row.dataset.id || '').toLowerCase();
+            const statusMatch =
+              activeStatusFilter.has('all') ||
+              (activeStatusFilter.has('online')  && rowStatus === 'active') ||
+              (activeStatusFilter.has('stopped') && rowStatus === 'stopped') ||
+              (activeStatusFilter.has('errored') && rowStatus === 'errored') ||
+              activeStatusFilter.has(rowStatus);
+            const searchMatch = !term || rowId.includes(term) ||
+              [...row.querySelectorAll('td')].some(td => td.textContent.toLowerCase().includes(term));
+            row.style.display = (statusMatch && searchMatch) ? '' : 'none';
+            if (statusMatch && searchMatch) anyVisible = true;
+          });
+
+          section.style.display = anyVisible ? '' : 'none';
         });
       }
+    }
+
+    function _updateFilterCounts() {
+      // Use allItems for accurate cross-type counts
+      const source = allItems.length ? allItems : [...document.querySelectorAll('.card[data-name]')].map(card => ({
+        type: card.dataset.type || 'server',
+        statusBucket: _normStatus(card.dataset.status),
+      }));
+
+      const total = source.length;
+      const tc = { server: 0, daemon: 0, cron: 0, launchd: 0 };
+      const sc = { online: 0, stopped: 0, errored: 0 };
+
+      for (const item of source) {
+        const t = item.type || 'server';
+        if (t === 'pm2' || t === 'merge' || t === 'static' || t === 'server') tc.server++;
+        else if (tc[t] !== undefined) tc[t]++;
+
+        const b = item.statusBucket || _normStatus(item.status);
+        if (b === 'active' || b === 'online') sc.online++;
+        else if (b === 'stopped') sc.stopped++;
+        else if (b === 'errored') sc.errored++;
+      }
+
+      const set = (id, n) => { const el = document.getElementById(id); if (el) el.textContent = n; };
+      set('tc-all',     total);
+      set('tc-server',  tc.server);
+      set('tc-daemon',  tc.daemon);
+      set('tc-cron',    tc.cron);
+      set('tc-launchd', tc.launchd);
+      set('sc-all',     total);
+      set('sc-online',  sc.online);
+      set('sc-stopped', sc.stopped);
+      set('sc-errored', sc.errored);
+    }
+
+    function _applySortOrder() {
+      const grid = document.getElementById('grid');
+      // Only sort in flat (ungrouped) view — groups have their own internal order
+      if (grid.querySelector('.group-section')) return;
+
+      const TYPE_ORDER = { server: 0, static: 1, daemon: 2, cron: 3, launchd: 4 };
+      const STATUS_ORDER = { online: 0, launching: 1, stopped: 2, errored: 3 };
+
+      const cards = [...grid.querySelectorAll('.card[data-name]')];
+      cards.sort((a, b) => {
+        switch (activeSortOrder) {
+          case 'name-asc':  return a.dataset.name.localeCompare(b.dataset.name);
+          case 'name-desc': return b.dataset.name.localeCompare(a.dataset.name);
+          case 'status': {
+            const sa = STATUS_ORDER[_normStatus(a.dataset.status)] ?? 9;
+            const sb = STATUS_ORDER[_normStatus(b.dataset.status)] ?? 9;
+            return sa !== sb ? sa - sb : a.dataset.name.localeCompare(b.dataset.name);
+          }
+          case 'type': {
+            const ta = TYPE_ORDER[a.dataset.type] ?? 9;
+            const tb = TYPE_ORDER[b.dataset.type] ?? 9;
+            return ta !== tb ? ta - tb : a.dataset.name.localeCompare(b.dataset.name);
+          }
+          case 'restarts-desc': {
+            const getRestarts = (card) => {
+              const labels = card.querySelectorAll('.stat-label');
+              for (const lbl of labels) {
+                if (lbl.textContent.trim() === 'restarts') {
+                  return parseInt(lbl.nextElementSibling?.textContent || '0') || 0;
+                }
+              }
+              return 0;
+            };
+            const diff = getRestarts(b) - getRestarts(a);
+            return diff !== 0 ? diff : a.dataset.name.localeCompare(b.dataset.name);
+          }
+          default: return 0;
+        }
+      });
+      cards.forEach(card => grid.appendChild(card));
+    }
+
+    // applySearch kept as the oninput target — delegates to applyFilters
+    function applySearch(q) {
+      applyFilters();
     }
 
     // ── View toggle (cards ↔ table) ────────────────────────────────────────
@@ -2991,10 +4731,12 @@ function renderPage(processes) {
       var gridEl = document.getElementById('grid');
       var tableEl = document.getElementById('table-wrap');
       if (navbar) navbar.updateSegToggle('view-seg', isTable ? 'table' : 'cards');
-      if (isTable && lastProcesses.length) {
-        renderTable(lastProcesses);
+      if (isTable) {
+        if (allItems.length) renderTableFromItems(allItems);
+        else if (lastProcesses.length) renderTable(lastProcesses);
         if (lastMetrics) drawSparklines(lastMetrics);
         if (lastHealthMetrics) drawHealthSparklines(lastHealthMetrics);
+        applyFilters();
       }
       if (skipAnim) {
         gridEl.style.display = isTable ? 'none' : '';
@@ -3017,9 +4759,200 @@ function renderPage(processes) {
       }, 180);
     }
 
+    // ── Unified Item table renderer (Phases 3+4) ──────────────────────────
+    const TABLE_ADAPTER_META = {
+      pm2:     { icon: '▶',  label: 'pm2'     },
+      merge:   { icon: '⚡', label: 'merge'   },
+      static:  { icon: '🔗', label: 'static'  },
+      daemon:  { icon: '⚙', label: 'Daemon'  },
+      cron:    { icon: '⏱', label: 'Cron'    },
+      launchd: { icon: '⌘', label: 'LaunchD' },
+    };
+
+    function _itemTypeToFilterKey(type) {
+      if (type === 'pm2' || type === 'merge' || type === 'static') return 'server';
+      return type;
+    }
+
+    function _renderItemActions(item) {
+      const n = _esc(item.name);
+      const type = item.type;
+      if (type === 'pm2' || type === 'merge') {
+        const isOnline = item.statusBucket === 'active';
+        return isOnline
+          ? \`<button class="btn btn-sm action-btn" onclick="doAction('restart','\${n}',this)" title="Restart">↺</button>\`
+            + \`<button class="btn btn-sm action-btn" onclick="doAction('reload','\${n}',this)" title="Reload">⟳</button>\`
+            + \`<button class="btn btn-sm btn-danger action-btn" onclick="doAction('stop','\${n}',this)" title="Stop">■</button>\`
+            + \`<button class="btn btn-sm" onclick="openLogs('\${n}')" title="Logs">⋮</button>\`
+            + (type === 'pm2' ? \`<button class="btn btn-sm" onclick="openInfo('\${n}')" title="Info">ℹ</button>\` : '')
+          : \`<button class="btn btn-sm btn-ok action-btn" onclick="doAction('start','\${n}',this)" title="Start">▶</button>\`
+            + \`<button class="btn btn-sm btn-danger action-btn" onclick="confirmDelete('\${n}')" title="Delete">✕</button>\`
+            + \`<button class="btn btn-sm" onclick="openLogs('\${n}')" title="Logs">⋮</button>\`;
+      }
+      if (type === 'static') {
+        return \`<button class="btn btn-sm" onclick="checkHealth('\${n}')" title="Health check">♡</button>\`
+          + \`<button class="btn btn-sm btn-danger" onclick="deleteStaticUrl('\${n}')" title="Remove">✕</button>\`;
+      }
+      if (type === 'daemon') {
+        const isOnline = item.statusBucket === 'active';
+        return isOnline
+          ? \`<button class="btn btn-sm btn-danger action-btn" onclick="doDaemonAction('stop','\${n}',this)" title="Stop">■</button>\`
+            + \`<button class="btn btn-sm action-btn" onclick="doDaemonAction('restart','\${n}',this)" title="Restart">↺</button>\`
+            + \`<button class="btn btn-sm" onclick="openDaemonLogs('\${n}')" title="Logs">⋮</button>\`
+          : \`<button class="btn btn-sm btn-ok action-btn" onclick="doDaemonAction('start','\${n}',this)" title="Start">▶</button>\`
+            + \`<button class="btn btn-sm btn-danger" onclick="confirmDeleteDaemon('\${n}')" title="Delete">✕</button>\`
+            + \`<button class="btn btn-sm" onclick="openDaemonLogs('\${n}')" title="Logs">⋮</button>\`;
+      }
+      if (type === 'cron') {
+        const isActive = item.statusBucket === 'active';
+        return (isActive
+            ? \`<button class="btn btn-sm btn-danger" onclick="doCronAction('disable','\${n}',this)" title="Disable">○</button>\`
+            : \`<button class="btn btn-sm btn-ok" onclick="doCronAction('enable','\${n}',this)" title="Enable">●</button>\`)
+          + \`<button class="btn btn-sm" onclick="doCronAction('run-now','\${n}',this)" title="Run now">▶</button>\`
+          + \`<button class="btn btn-sm" onclick="openCronDetail('\${n}')" title="Detail">ℹ</button>\`;
+      }
+      if (type === 'launchd') {
+        const isLoaded = item.statusBucket === 'active' || (item.meta && item.meta.loaded);
+        return isLoaded
+          ? \`<button class="btn btn-sm btn-danger action-btn" onclick="doLaunchdAction('stop','\${n}',this)" title="Stop">■</button>\`
+            + \`<button class="btn btn-sm action-btn" onclick="doLaunchdAction('kickstart','\${n}',this)" title="Restart">↺</button>\`
+            + \`<button class="btn btn-sm" onclick="openLaunchdLogs('\${n}')" title="Logs">⋮</button>\`
+            + \`<button class="btn btn-sm" onclick="openLaunchdDetail('\${n}')" title="Detail">ℹ</button>\`
+          : \`<button class="btn btn-sm btn-ok" onclick="doLaunchdAction('load','\${n}',this)" title="Load">▶</button>\`
+            + \`<button class="btn btn-sm" onclick="openLaunchdDetail('\${n}')" title="Detail">ℹ</button>\`;
+      }
+      return '';
+    }
+
+    const TABLE_COLS = {
+      pm2: [
+        { id: 'status',   label: '',          w: '2rem',   a: 'center', r: i => \`<span class="tbl-status-dot \${i.status}" title="\${i.status}"></span>\` },
+        { id: 'name',     label: 'name',      s: true,                  r: i => _esc(i.name) + (i.title ? \` <span class="proc-title">\${_esc(i.title)}</span>\` : '') },
+        { id: 'port',     label: 'port',      w: '4.5rem',              r: i => i.meta.port ? \`<a href="http://localhost:\${i.meta.port}" target="_blank">:\${i.meta.port}</a>\` : '—' },
+        { id: 'uptime',   label: 'uptime',    w: '5rem',   s: true,     r: i => i.metrics.uptimeHuman || '—' },
+        { id: 'cpu',      label: 'cpu',       w: '4rem',   a: 'right',  r: i => i.metrics.cpu != null ? i.metrics.cpu + '%' : '—' },
+        { id: 'mem',      label: 'mem',       w: '5rem',   a: 'right',  r: i => i.metrics.memoryHuman || '—' },
+        { id: 'restarts', label: 'restarts',  w: '4.5rem', a: 'right',  r: i => \`<span class="\${(i.metrics.restarts||0)>=3?'tbl-warn':''}">\${i.metrics.restarts||0}</span>\` },
+        { id: 'trend',    label: 'trend',     w: '5rem',                r: i => \`<canvas class="tbl-sparkline" data-name="\${_esc(i.name)}" width="80" height="20"></canvas>\` },
+        { id: 'actions',  label: '',          w: '8rem',                r: i => _renderItemActions(i) },
+      ],
+      merge: [
+        { id: 'status',  label: '',       w: '2rem',  a: 'center', r: i => \`<span class="tbl-status-dot \${i.status}" title="\${i.status}"></span>\` },
+        { id: 'name',    label: 'name',   s: true,                 r: i => _esc(i.name) + (i.title ? \` <span class="proc-title">\${_esc(i.title)}</span>\` : '') },
+        { id: 'members', label: 'parts',  w: '8rem',               r: i => _esc((i.meta.members||[]).join(', ')) },
+        { id: 'actions', label: '',       w: '6rem',               r: i => _renderItemActions(i) },
+      ],
+      static: [
+        { id: 'status',  label: '',       w: '2rem',  a: 'center', r: i => \`<span class="tbl-status-dot" id="tbl-health-\${_esc(i.name)}" style="background:var(--text-faint)" title="Static URL"></span>\` },
+        { id: 'name',    label: 'name',   s: true,                 r: i => \`<span style="color:var(--accent);font-size:0.7rem">🔗</span> \${_esc(i.title||i.name)}\` },
+        { id: 'url',     label: 'url',                             r: i => i.meta.url ? \`<a href="\${_esc(i.meta.url)}" target="_blank" style="font-size:0.72rem">\${_esc(i.meta.url.replace(/^https?:\\/\\//, ''))}</a>\` : '—' },
+        { id: 'health',  label: 'health', w: '5rem',               r: i => \`<canvas class="tbl-sparkline health-sparkline" data-health-slug="\${_esc(i.name)}" width="80" height="20"></canvas>\` },
+        { id: 'actions', label: '',       w: '5rem',               r: i => _renderItemActions(i) },
+      ],
+      daemon: [
+        { id: 'status',   label: '',          w: '2rem',   a: 'center', r: i => \`<span class="tbl-status-dot \${i.status}" title="\${i.status}"></span>\` },
+        { id: 'name',     label: 'name',      s: true,                  r: i => _esc(i.name) + (i.title ? \` <span class="proc-title">\${_esc(i.title)}</span>\` : '') },
+        { id: 'pid',      label: 'pid',       w: '4rem',   a: 'right',  r: i => i.meta.pid || '—' },
+        { id: 'uptime',   label: 'uptime',    w: '5rem',   s: true,     r: i => i.metrics.uptimeHuman || '—' },
+        { id: 'cpu',      label: 'cpu',       w: '4rem',   a: 'right',  r: i => i.metrics.cpu != null ? i.metrics.cpu + '%' : '—' },
+        { id: 'mem',      label: 'mem',       w: '5rem',   a: 'right',  r: i => i.metrics.memoryHuman || '—' },
+        { id: 'restarts', label: 'restarts',  w: '4.5rem', a: 'right',  r: i => i.metrics.restarts||0 },
+        { id: 'actions',  label: '',          w: '7rem',               r: i => _renderItemActions(i) },
+      ],
+      cron: [
+        { id: 'status',   label: '',           w: '2rem',  a: 'center', r: i => \`<span class="tbl-status-dot \${i.statusBucket==='active'?'online':'stopped'}" title="\${i.status}"></span>\` },
+        { id: 'name',     label: 'name / id',  s: true,                 r: i => _esc(i.name) },
+        { id: 'schedule', label: 'schedule',   w: '10rem',              r: i => _esc(i.meta.schedule || i.meta.scheduleRaw || '—') },
+        { id: 'next',     label: 'next run',   w: '7rem',               r: i => i.meta.nextRunMs ? _esc(new Date(i.meta.nextRunMs).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})) : '—' },
+        { id: 'command',  label: 'command',                             r: i => \`<span style="font-size:0.65rem;color:var(--text-faint);font-family:monospace">\${_esc((i.meta.command||'').slice(0,80))}\${(i.meta.command||'').length>80?'…':''}</span>\` },
+        { id: 'actions',  label: '',           w: '6rem',               r: i => _renderItemActions(i) },
+      ],
+      launchd: [
+        { id: 'status',   label: '',           w: '2rem',  a: 'center', r: i => \`<span class="tbl-status-dot \${i.status}" title="\${i.status}"></span>\` },
+        { id: 'name',     label: 'label',      s: true,                 r: i => _esc(i.name) },
+        { id: 'schedule', label: 'schedule',   w: '10rem',              r: i => _esc(i.meta.schedule || '—') },
+        { id: 'pid',      label: 'pid',        w: '4rem',  a: 'right',  r: i => i.meta.pid || '—' },
+        { id: 'exit',     label: 'last exit',  w: '5rem',  a: 'right',  r: i => i.meta.lastExitStatus != null ? String(i.meta.lastExitStatus) : '—' },
+        { id: 'plist',    label: 'plist',      w: '14rem',              r: i => i.meta.plistPath ? \`<span title="\${_esc(i.meta.plistPath)}" style="font-size:0.6rem;color:var(--text-faint)">\${_esc(i.meta.plistPath.replace(/^.*\\/(.+\\.plist)$/,'$1'))}</span>\` : '—' },
+        { id: 'actions',  label: '',           w: '7rem',               r: i => _renderItemActions(i) },
+      ],
+    };
+
+    let _tblSortState = {}; // { [type]: { col, dir } }
+
+    function renderTableFromItems(items) {
+      const q = document.getElementById('search-input').value.trim().toLowerCase();
+      const sectionsEl = document.getElementById('table-sections');
+      if (!sectionsEl) return;
+
+      // Group by type, preserving order
+      const byType = {};
+      const typeOrder = [];
+      for (const item of items) {
+        if (!byType[item.type]) { byType[item.type] = []; typeOrder.push(item.type); }
+        byType[item.type].push(item);
+      }
+
+      let html = '';
+      for (const type of typeOrder) {
+        let typeItems = byType[type];
+        const meta = TABLE_ADAPTER_META[type] || { icon: '?', label: type };
+        const cols = TABLE_COLS[type];
+        if (!cols) continue;
+
+        // Apply type-level sort
+        const sort = _tblSortState[type];
+        if (sort) {
+          typeItems = [...typeItems].sort((a, b) => {
+            const col = cols.find(c => c.id === sort.col);
+            if (!col) return 0;
+            // Simple string sort on rendered text — good enough for name, schedule, etc.
+            const av = sort.col === 'name' ? a.name : sort.col === 'uptime' ? (a.metrics.uptimeMs||0) : sort.col === 'cpu' ? (a.metrics.cpu||0) : sort.col === 'mem' ? (a.metrics.memoryBytes||0) : sort.col === 'restarts' ? (a.metrics.restarts||0) : 0;
+            const bv = sort.col === 'name' ? b.name : sort.col === 'uptime' ? (b.metrics.uptimeMs||0) : sort.col === 'cpu' ? (b.metrics.cpu||0) : sort.col === 'mem' ? (b.metrics.memoryBytes||0) : sort.col === 'restarts' ? (b.metrics.restarts||0) : 0;
+            const cmp = typeof av === 'string' ? av.localeCompare(bv) : av - bv;
+            return sort.dir === 'desc' ? -cmp : cmp;
+          });
+        }
+
+        html += \`<div class="table-section" data-type="\${type}">\`;
+        html += \`<div class="table-section-header"><span class="type-icon">\${meta.icon}</span><span class="type-label">\${meta.label}</span><span class="type-count">(\${typeItems.length})</span></div>\`;
+        html += \`<table class="process-table"><thead><tr>\`;
+        for (const col of cols) {
+          const styles = [col.w ? \`width:\${col.w}\` : '', col.a ? \`text-align:\${col.a}\` : ''].filter(Boolean).join(';');
+          const isSorted = sort && sort.col === col.id;
+          const sortClass = isSorted ? (sort.dir === 'asc' ? ' sorted-asc' : ' sorted-desc') : '';
+          html += \`<th\${styles ? \` style="\${styles}"\` : ''}>\${col.s ? \`<button class="tbl-sort-btn\${sortClass}" data-type="\${type}" data-col="\${col.id}" onclick="tblToggleSort('\${type}','\${col.id}')">\${col.label}</button>\` : col.label}</th>\`;
+        }
+        html += \`</tr></thead><tbody>\`;
+        for (const item of typeItems) {
+          const sf = [item.name, item.title, item.meta?.command, item.meta?.url, item.meta?.schedule].filter(Boolean).join(' ').toLowerCase();
+          const vis = !q || sf.includes(q);
+          html += \`<tr data-id="\${_esc(item.id)}" data-type="\${item.type}" data-status="\${item.statusBucket}" style="display:\${vis?'':'none'}">\`;
+          for (const col of cols) {
+            html += \`<td\${col.a ? \` style="text-align:\${col.a}"\` : ''}>\${col.r(item)}</td>\`;
+          }
+          html += \`</tr>\`;
+        }
+        html += \`</tbody></table></div>\`;
+      }
+      sectionsEl.innerHTML = html;
+    }
+
+    function tblToggleSort(type, colId) {
+      const cur = _tblSortState[type];
+      if (cur && cur.col === colId) {
+        _tblSortState[type] = { col: colId, dir: cur.dir === 'asc' ? 'desc' : 'asc' };
+      } else {
+        _tblSortState[type] = { col: colId, dir: 'asc' };
+      }
+      renderTableFromItems(allItems);
+      applyFilters();
+    }
+
     function renderTable(procs) {
       const q = document.getElementById('search-input').value.trim().toLowerCase();
       const tbody = document.getElementById('table-body');
+      if (!tbody) return; // superseded by renderTableFromItems — no-op if element absent
       const groups = DASH_CONFIG.groups || {};
       const entries = DASH_CONFIG.entries || {};
       const grouped = localStorage.getItem('pm2-group-view') === 'grouped';
@@ -3146,6 +5079,16 @@ function renderPage(processes) {
     // Initialise view (skip animation on page load)
     applyView(true);
 
+    // Restore persisted filter state (tabs + sort select)
+    (function() {
+      _syncTabActive('.type-tab',   activeTypeFilter);
+      _syncTabActive('.status-tab', activeStatusFilter);
+      if (activeSortOrder) {
+        var sel = document.getElementById('sort-select');
+        if (sel) sel.value = activeSortOrder;
+      }
+    })();
+
     showSkeletons(${Math.max(count, 3)});
     refresh();
     setInterval(refresh, 5000);
@@ -3158,10 +5101,10 @@ function renderPage(processes) {
         btn.innerHTML = \`<span class="btn-spinner"></span> \${cmd}\`;
       }
       try {
-        const res = await fetch('/api/action', {
+        const res = await fetch('/api/items/pm2/' + encodeURIComponent(name) + '/action', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ cmd, name }),
+          body: JSON.stringify({ cmd }),
         });
         const data = await res.json();
         toast(data.ok ? cmd + ' ' + name + ' ✓' : 'Error: ' + (data.error || '?'), data.ok ? 'ok' : 'err');
@@ -3323,9 +5266,357 @@ function renderPage(processes) {
       }
     }
 
+    // ── Daemon actions ──────────────────────────────────────────────────────
+    async function doDaemonAction(cmd, key, btn) {
+      if (btn) { btn.disabled = true; btn.textContent = '…'; }
+      try {
+        const res = await fetch('/api/items/daemon/' + encodeURIComponent(key) + '/action', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cmd }),
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || 'Unknown error');
+        await refresh();
+      } catch (e) {
+        alert('Daemon action failed: ' + e.message);
+      } finally {
+        if (btn) { btn.disabled = false; }
+      }
+    }
+
+    async function confirmDeleteDaemon(key) {
+      if (!confirm('Remove daemon "' + key + '" from registry? This will stop it if running.')) return;
+      try {
+        const res = await fetch('/api/daemons/' + encodeURIComponent(key), { method: 'DELETE' });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || 'Delete failed');
+        await refresh();
+      } catch (e) {
+        alert('Remove failed: ' + e.message);
+      }
+    }
+
+    // ── Daemon logs ─────────────────────────────────────────────────────────
+    var currentDaemonLogKey = null;
+    var currentDaemonLogTab = 'out';
+
+    function setDaemonLogTab(tab) {
+      currentDaemonLogTab = tab;
+      document.getElementById('daemon-log-tab-out').style.opacity = tab === 'out' ? '1' : '0.5';
+      document.getElementById('daemon-log-tab-err').style.opacity = tab === 'err' ? '1' : '0.5';
+      fetchDaemonLogs(currentDaemonLogKey, tab);
+    }
+
+    async function openDaemonLogs(key) {
+      currentDaemonLogKey = key;
+      currentDaemonLogTab = 'out';
+      document.getElementById('daemon-log-tab-out').style.opacity = '1';
+      document.getElementById('daemon-log-tab-err').style.opacity = '0.5';
+      document.getElementById('daemon-log-name').textContent = key;
+      document.getElementById('daemon-log-output').textContent = 'Loading…';
+      document.getElementById('daemon-log-modal').classList.add('open');
+      await fetchDaemonLogs(key, 'out');
+    }
+
+    async function fetchDaemonLogs(key, tab) {
+      if (!key) return;
+      const lines = document.getElementById('daemon-log-lines').value || 80;
+      const endpoint = tab === 'err'
+        ? '/api/daemons/' + encodeURIComponent(key) + '/errlog?lines=' + lines
+        : '/api/daemons/' + encodeURIComponent(key) + '/logs?lines=' + lines;
+      try {
+        const res = await fetch(endpoint);
+        const text = await res.text();
+        const el = document.getElementById('daemon-log-output');
+        el.textContent = text;
+        el.scrollTop = el.scrollHeight;
+      } catch (e) {
+        document.getElementById('daemon-log-output').textContent = 'Error: ' + e.message;
+      }
+    }
+
+    // ── Daemon info modal ───────────────────────────────────────────────────
+    async function openDaemonInfo(key) {
+      document.getElementById('daemon-info-name').textContent = key;
+      document.getElementById('daemon-info-body').innerHTML = 'Loading…';
+      document.getElementById('daemon-info-modal').classList.add('open');
+      try {
+        const res = await fetch('/api/daemons/' + encodeURIComponent(key));
+        const d = await res.json();
+        function row(label, val) {
+          var th = '<th style="text-align:left;color:var(--text-muted);padding:3px 8px 3px 0;width:35%">' + label + '</th>';
+          return '<tr>' + th + '<td>' + val + '</td></tr>';
+        }
+        function code(s) { return '<code style="word-break:break-all">' + _esc(s) + '</code>'; }
+        var envKeys = Object.keys(d.env || {});
+        var html = '<table style="width:100%;border-collapse:collapse;font-size:0.78rem">'
+          + row('Key', code(d.key))
+          + row('Status', _esc(d.status) + (d.pid ? ' (PID ' + d.pid + ')' : ''))
+          + row('Command', code(d.command))
+          + row('Working dir', code(d.workdir || '—'))
+          + row('Uptime', _esc(d.uptime_human || '—'))
+          + row('Restarts', d.restarts + (d.autoRestart ? ' (auto, max ' + d.maxRestarts + ')' : ''))
+          + row('stdout', code(d.logFile))
+          + row('stderr', code(d.errFile))
+          + (envKeys.length ? row('Env', '<pre style="margin:0;font-size:0.7rem">' + _esc(JSON.stringify(d.env, null, 2)) + '</pre>') : '')
+          + '</table>';
+        html += '<div style="margin-top:0.75rem;display:flex;gap:0.5rem" id="daemon-info-actions"></div>';
+        document.getElementById('daemon-info-body').innerHTML = html;
+        var actEl = document.getElementById('daemon-info-actions');
+        var logsBtn = document.createElement('button');
+        logsBtn.className = 'btn'; logsBtn.textContent = '⋮ Logs';
+        logsBtn.onclick = function() { openDaemonLogs(d.key); };
+        actEl.appendChild(logsBtn);
+        if (d.status === 'online') {
+          var rstBtn = document.createElement('button');
+          rstBtn.className = 'btn btn-warn action-btn'; rstBtn.textContent = '↺ Restart';
+          rstBtn.onclick = function() { doDaemonAction('restart', d.key, rstBtn); };
+          actEl.appendChild(rstBtn);
+        }
+      } catch (e) {
+        document.getElementById('daemon-info-body').textContent = 'Error: ' + e.message;
+      }
+    }
+
+    // ── Daemon create modal ─────────────────────────────────────────────────
+    function openCreateDaemonModal() {
+      document.getElementById(\'dc-key\').value = \'\';
+      document.getElementById(\'dc-command\').value = \'\';
+      document.getElementById(\'dc-workdir\').value = \'\';
+      document.getElementById(\'dc-autorestart\').value = \'false\';
+      document.getElementById(\'dc-maxrestarts\').value = \'5\';
+      document.getElementById(\'dc-error\').style.display = \'none\';
+      document.getElementById(\'daemon-create-modal\').classList.add(\'open\');
+      setTimeout(() => document.getElementById(\'dc-key\').focus(), 50);
+    }
+
+    async function submitCreateDaemon(andStart) {
+      const key = document.getElementById(\'dc-key\').value.trim();
+      const command = document.getElementById(\'dc-command\').value.trim();
+      const workdir = document.getElementById(\'dc-workdir\').value.trim();
+      const autoRestart = document.getElementById(\'dc-autorestart\').value === \'true\';
+      const maxRestarts = parseInt(document.getElementById(\'dc-maxrestarts\').value, 10) || 5;
+      const errEl = document.getElementById(\'dc-error\');
+      errEl.style.display = \'none\';
+      if (!key || !command) { errEl.textContent = \'Key and command are required.\'; errEl.style.display = \'block\'; return; }
+      try {
+        const res = await fetch(\'/api/daemons\', {
+          method: \'POST\', headers: { \'Content-Type\': \'application/json\' },
+          body: JSON.stringify({ key, command, workdir: workdir || undefined, autoRestart, maxRestarts }),
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || \'Create failed\');
+        if (andStart) await doDaemonAction(\'start\', key, null);
+        closeModal(\'daemon-create-modal\');
+        await refresh();
+      } catch (e) {
+        errEl.textContent = e.message;
+        errEl.style.display = \'block\';
+      }
+    }
+
+    // ── LaunchD actions ──────────────────────────────────────────────────────
+    async function doLaunchdAction(cmd, label, btn) {
+      if (btn) { btn.disabled = true; btn.textContent = '…'; }
+      try {
+        const res = await fetch('/api/items/launchd/' + encodeURIComponent(label) + '/action', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cmd }),
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || 'Unknown error');
+        const msgs = { load: 'Loaded', unload: 'Unloaded', kickstart: 'Restarted', stop: 'Stopped' };
+        toast((msgs[cmd] || cmd) + ': ' + label, 'ok');
+        refresh();
+      } catch (e) { toast('launchctl failed: ' + e.message, 'err'); }
+      finally { if (btn) { btn.disabled = false; } }
+    }
+
+    async function openLaunchdDetail(label) {
+      // Show modal immediately with loading state (~1.5s fetch)
+      document.getElementById('launchd-detail-name').textContent = label;
+      const body = document.getElementById('launchd-detail-body');
+      body.innerHTML = '<div style="color:var(--text-faint);padding:0.5rem 0;display:flex;align-items:center;gap:6px"><span style="display:inline-block;width:12px;height:12px;border:2px solid var(--text-faint);border-top-color:var(--accent);border-radius:50%;animation:spin 0.6s linear infinite"></span>Loading…</div>';
+      document.getElementById('launchd-detail-modal').classList.add('open');
+
+      let agent;
+      try {
+        const res = await fetch('/api/launchd/' + encodeURIComponent(label));
+        if (!res.ok) throw new Error('Not found');
+        agent = await res.json();
+      } catch (e) {
+        body.innerHTML = '<div style="color:var(--danger)">Failed to load details: ' + e.message + '</div>';
+        return;
+      }
+
+      document.getElementById('launchd-detail-name').textContent = agent._title || label;
+      body.innerHTML = '';
+
+      const rows = [
+        ['Label', agent.label],
+        ['Status', agent.status + (agent.pid ? ' (PID ' + agent.pid + ')' : '')],
+        ['Loaded', agent.loaded ? 'Yes' : 'No'],
+        ['Trigger', agent.schedule || (agent.runAtLoad ? 'On load' : '—')],
+        ['KeepAlive', agent.keepAlive ? 'Yes — auto-restarted by launchd' : 'No'],
+        ['Command', agent.command],
+        ['Plist', agent.plistPath],
+        ['Stdout', agent.stdoutPath || '—'],
+        ['Stderr', agent.stderrPath || '—'],
+        ['Last exit', agent.lastExitStatus != null ? String(agent.lastExitStatus) : '—'],
+      ];
+
+      const table = document.createElement('table');
+      table.style.cssText = 'width:100%;border-collapse:collapse';
+      for (const [lbl, val] of rows) {
+        const tr = document.createElement('tr');
+        const td1 = document.createElement('td');
+        td1.style.cssText = 'color:var(--text-faint);width:80px;padding:3px 8px 3px 0;vertical-align:top;white-space:nowrap';
+        td1.textContent = lbl;
+        const td2 = document.createElement('td');
+        td2.style.cssText = 'padding:3px 0;font-family:monospace;word-break:break-all;font-size:0.75rem';
+        td2.textContent = val;
+        tr.appendChild(td1); tr.appendChild(td2); table.appendChild(tr);
+      }
+      body.appendChild(table);
+
+      const actionsDiv = document.createElement('div');
+      actionsDiv.style.cssText = 'margin-top:12px;display:flex;gap:6px;flex-wrap:wrap';
+      const close = () => closeModal('launchd-detail-modal');
+
+      if (agent.loaded) {
+        if (agent.status === 'online') {
+          const ksBtn = document.createElement('button');
+          ksBtn.className = 'btn btn-warn'; ksBtn.textContent = '↺ Restart';
+          ksBtn.onclick = () => { close(); doLaunchdAction('kickstart', label, null); };
+          actionsDiv.appendChild(ksBtn);
+          const stBtn = document.createElement('button');
+          stBtn.className = 'btn btn-danger'; stBtn.textContent = '■ Stop';
+          stBtn.onclick = () => { close(); doLaunchdAction('stop', label, null); };
+          actionsDiv.appendChild(stBtn);
+        } else {
+          const ksBtn = document.createElement('button');
+          ksBtn.className = 'btn btn-ok'; ksBtn.textContent = '▶ Start';
+          ksBtn.onclick = () => { close(); doLaunchdAction('kickstart', label, null); };
+          actionsDiv.appendChild(ksBtn);
+        }
+        const ulBtn = document.createElement('button');
+        ulBtn.className = 'btn'; ulBtn.textContent = '⏏ Unload';
+        ulBtn.onclick = () => { close(); doLaunchdAction('unload', label, null); };
+        actionsDiv.appendChild(ulBtn);
+      } else {
+        const lBtn = document.createElement('button');
+        lBtn.className = 'btn btn-ok'; lBtn.textContent = '⬆ Load';
+        lBtn.onclick = () => { close(); doLaunchdAction('load', label, null); };
+        actionsDiv.appendChild(lBtn);
+      }
+
+      if (agent.stdoutPath) {
+        const logBtn = document.createElement('button');
+        logBtn.className = 'btn'; logBtn.textContent = '⋮ Logs';
+        logBtn.onclick = () => { close(); openLaunchdLogs(label, agent.stdoutPath); };
+        actionsDiv.appendChild(logBtn);
+      }
+      body.appendChild(actionsDiv);
+      document.getElementById('launchd-detail-modal').classList.add('open');
+    }
+
+    async function openLaunchdLogs(label, logPath) {
+      // Open modal immediately with loading state, then populate
+      const nameEl = document.getElementById('daemon-log-name');
+      const outEl  = document.getElementById('daemon-log-output');
+      if (nameEl) nameEl.textContent = label;
+      if (outEl)  outEl.textContent  = 'Loading…';
+      document.getElementById('daemon-log-modal').classList.add('open');
+      try {
+        const res  = await fetch('/api/launchd/' + encodeURIComponent(label) + '/logs');
+        const text = await res.text();
+        if (outEl) outEl.textContent = text || '(no log output)';
+      } catch (e) {
+        if (outEl) outEl.textContent = 'Failed to load logs: ' + e.message;
+      }
+    }
+
+    // ── Cron actions ─────────────────────────────────────────────────────────
+    async function doCronAction(cmd, id, btn) {
+      if (btn) { btn.disabled = true; btn.textContent = '…'; }
+      try {
+        const res = await fetch('/api/items/cron/' + encodeURIComponent(id) + '/action', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cmd }),
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || 'Unknown error');
+        toast(cmd === 'run-now' ? 'Running now…' : (cmd === 'enable' ? 'Cron enabled' : 'Cron disabled'), 'ok');
+        refresh();
+      } catch (e) { toast('Cron action failed: ' + e.message, 'err'); }
+      finally { if (btn) { btn.disabled = false; } }
+    }
+
+    async function openCronDetail(id) {
+      // Fetch the cron entry data
+      let entry;
+      try {
+        const res = await fetch('/api/crons/' + encodeURIComponent(id));
+        if (!res.ok) throw new Error('Not found');
+        entry = await res.json();
+      } catch (e) { toast('Failed to load cron details', 'err'); return; }
+
+      document.getElementById('cron-detail-name').textContent = entry._title || id;
+      const body = document.getElementById('cron-detail-body');
+      body.innerHTML = '';
+
+      const rows = [
+        ['ID', entry.id],
+        ['Schedule', entry.schedule],
+        ['Human', entry.humanSchedule],
+        ['Next run', entry.nextRunMs ? new Date(entry.nextRunMs).toLocaleString() : '—'],
+        ['Status', entry.enabled ? 'Enabled' : 'Disabled (commented out)'],
+        ['Command', entry.command],
+      ];
+
+      const table = document.createElement('table');
+      table.style.cssText = 'width:100%;border-collapse:collapse';
+      for (const [label, val] of rows) {
+        const tr = document.createElement('tr');
+        const td1 = document.createElement('td');
+        td1.style.cssText = 'color:var(--text-faint);width:90px;padding:4px 8px 4px 0;vertical-align:top;white-space:nowrap';
+        td1.textContent = label;
+        const td2 = document.createElement('td');
+        td2.style.cssText = 'padding:4px 0;font-family:monospace;word-break:break-all';
+        td2.textContent = val;
+        tr.appendChild(td1); tr.appendChild(td2); table.appendChild(tr);
+      }
+      body.appendChild(table);
+
+      const actionsDiv = document.createElement('div');
+      actionsDiv.style.cssText = 'margin-top:12px;display:flex;gap:6px;flex-wrap:wrap';
+
+      if (entry.enabled) {
+        const runBtn = document.createElement('button');
+        runBtn.className = 'btn btn-ok';
+        runBtn.textContent = '▶ Run Now';
+        runBtn.onclick = () => { closeModal('cron-detail-modal'); doCronAction('run-now', id, null); };
+        actionsDiv.appendChild(runBtn);
+
+        const disBtn = document.createElement('button');
+        disBtn.className = 'btn';
+        disBtn.textContent = '⏸ Disable';
+        disBtn.onclick = () => { closeModal('cron-detail-modal'); doCronAction('disable', id, null); };
+        actionsDiv.appendChild(disBtn);
+      } else {
+        const enBtn = document.createElement('button');
+        enBtn.className = 'btn btn-ok';
+        enBtn.textContent = '▶ Enable';
+        enBtn.onclick = () => { closeModal('cron-detail-modal'); doCronAction('enable', id, null); };
+        actionsDiv.appendChild(enBtn);
+      }
+      body.appendChild(actionsDiv);
+      document.getElementById('cron-detail-modal').classList.add('open');
+    }
+
     // ── Help ────────────────────────────────────────────────────────────────
     function openHelp() {
-      document.getElementById('help-modal').classList.add('open');
+      document.getElementById(\'help-modal\').classList.add(\'open\');
     }
 
     // ── Modals ─────────────────────────────────────────────────────────────
@@ -3559,6 +5850,9 @@ function renderPage(processes) {
         { id: 'scan-btn', label: 'Scan', icon: '🔍', key: 'd', noMod: true, hint: 'discover',
           title: 'Scan for new projects (d)',
           group: 'actions', action: () => openScanModal() },
+        { id: 'daemon-btn', label: 'Daemon', icon: '🔧', key: 'n', noMod: true, hint: 'new daemon',
+          title: 'Register a new custom daemon (n)',
+          group: 'actions', action: () => openCreateDaemonModal() },
         { type: 'nav-sep' },
         // ── Settings ──
         { id: 'config-btn', label: '', icon: '⚙', key: 'c', noMod: true, hint: 'config',
@@ -3660,7 +5954,7 @@ function renderPage(processes) {
     async function doGroupAction(cmd, gid) {
       try {
         const entries = Object.entries(DASH_CONFIG.entries || {}).filter(([,v]) => v.group === gid).map(([k]) => k);
-        for (const name of entries) { await fetch('/api/action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cmd, name }) }); }
+        for (const name of entries) { await fetch('/api/items/pm2/' + encodeURIComponent(name) + '/action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cmd }) }); }
         const gname = (DASH_CONFIG.groups[gid] || {}).name || gid;
         toast(cmd + ' all in ' + gname + ' ✓', 'ok');
         setTimeout(refresh, 800);
@@ -4871,6 +7165,7 @@ function handleRequest(req, res) {
       metrics: metricsSnapshot(),
       healthMetrics: healthSnapshot(),
       processes: processes.map(summarizeProcess),
+      items: aggregateItems(),   // unified Item[] for client pipeline
       config: CONFIG,
     }));
     return;
@@ -4970,27 +7265,39 @@ function handleRequest(req, res) {
     return;
   }
 
-  if (req.method === 'POST' && path === '/api/action') {
-    let body = '';
-    req.on('data', (c) => (body += c));
-    req.on('end', () => {
+  // POST /api/items/:type/:id/action — unified adapter dispatch
+  if (req.method === 'POST' && path.match(/^\/api\/items\/[^/]+\/[^/]+\/action$/)) {
+    const rest = path.slice('/api/items/'.length, -'/action'.length);
+    const slashIdx = rest.indexOf('/');
+    const type = rest.slice(0, slashIdx);
+    const id = decodeURIComponent(rest.slice(slashIdx + 1));
+    const adapter = ITEM_ADAPTERS[type];
+    if (!adapter) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: `Unknown adapter type: ${type}`, availableTypes: Object.keys(ITEM_ADAPTERS) }));
+      return;
+    }
+    parseBody(req).then(async (body) => {
+      const cmd = body.cmd;
       try {
-        const { cmd, name } = JSON.parse(body);
-        const ALLOWED = ['restart', 'reload', 'stop', 'start', 'delete', 'flush', 'reset'];
-        if (!ALLOWED.includes(cmd) || !validateName(name)) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: 'invalid command or name' }));
-          return;
-        }
-        exec(`pm2 ${cmd} ${JSON.stringify(name)}`, { timeout: 15000 }, (err, stdout) => {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: !err, error: err?.message, output: stdout?.trim() }));
-        });
+        const result = await Promise.resolve(adapter.action(`${type}:${id}`, cmd));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
       } catch (e) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, error: String(e) }));
       }
+    }).catch((e) => {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: String(e) }));
     });
+    return;
+  }
+
+  // POST /api/action — DEPRECATED (410 Gone)
+  if (req.method === 'POST' && path === '/api/action') {
+    res.writeHead(410, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Deprecated endpoint', migration: 'Use POST /api/items/pm2/<name>/action with body { cmd }', docs: 'GET /api' }));
     return;
   }
 
@@ -5505,19 +7812,320 @@ curl -s -X POST http://localhost:${PORT}/api/groups \\
     return;
   }
 
+  // ── Daemon API ────────────────────────────────────────────────────────────
+
+  // GET /api/daemons — list all registered daemons with runtime stats
+  if (req.method === 'GET' && path === '/api/daemons') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ daemons: daemonManager.listAll() }));
+    return;
+  }
+
+  // POST /api/daemons — register a new daemon (does not start it)
+  if (req.method === 'POST' && path === '/api/daemons') {
+    parseBody(req).then((body) => {
+      try {
+        const { key, command, workdir, logFile, errFile, env, autoRestart, maxRestarts, restartDelay } = body;
+        if (!key || !command) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'key and command are required' })); return; }
+        if (!/^[a-zA-Z0-9_-]+$/.test(key)) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'key must be alphanumeric/hyphen/underscore' })); return; }
+        if (CONFIG.daemons[key]) { res.writeHead(409, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: `Daemon '${key}' already exists` })); return; }
+        CONFIG.daemons[key] = {
+          command,
+          workdir: workdir || os.homedir(),
+          ...(logFile ? { logFile } : {}),
+          ...(errFile ? { errFile } : {}),
+          env: env || {},
+          autoRestart: autoRestart ?? false,
+          maxRestarts: maxRestarts ?? 5,
+          restartDelay: restartDelay ?? 3000,
+        };
+        saveConfig();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, key }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: String(e) }));
+      }
+    });
+    return;
+  }
+
+  // PATCH /api/daemons/:key — update daemon config
+  if (req.method === 'PATCH' && path.match(/^\/api\/daemons\/[^/]+$/) ) {
+    const key = decodeURIComponent(path.slice('/api/daemons/'.length));
+    if (!CONFIG.daemons[key]) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'Daemon not found' })); return; }
+    parseBody(req).then((body) => {
+      try {
+        const allowed = ['command', 'workdir', 'logFile', 'errFile', 'env', 'autoRestart', 'maxRestarts', 'restartDelay'];
+        for (const k of allowed) {
+          if (body[k] !== undefined) CONFIG.daemons[key][k] = body[k];
+        }
+        saveConfig();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: String(e) }));
+      }
+    });
+    return;
+  }
+
+  // DELETE /api/daemons/:key — remove daemon from registry (stops if running)
+  if (req.method === 'DELETE' && path.match(/^\/api\/daemons\/[^/]+$/)) {
+    const key = decodeURIComponent(path.slice('/api/daemons/'.length));
+    if (!CONFIG.daemons[key]) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'Daemon not found' })); return; }
+    const doDelete = async () => {
+      try {
+        const r = daemonManager.runtime[key];
+        if (r?.proc) await daemonManager.stop(key);
+        delete CONFIG.daemons[key];
+        delete daemonManager.runtime[key];
+        saveConfig();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: String(e) }));
+      }
+    };
+    doDelete();
+    return;
+  }
+
+  // POST /api/daemons/:key/action — DEPRECATED (410 Gone)
+  if (req.method === 'POST' && path.match(/^\/api\/daemons\/[^/]+\/action$/)) {
+    const key = decodeURIComponent(path.slice('/api/daemons/'.length, -'/action'.length));
+    res.writeHead(410, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Deprecated endpoint', migration: `Use POST /api/items/daemon/${key}/action with body { cmd }`, docs: 'GET /api' }));
+    return;
+  }
+
+  // POST /api/daemons/:key/signal — send UNIX signal to daemon PID
+  if (req.method === 'POST' && path.match(/^\/api\/daemons\/[^/]+\/signal$/)) {
+    const key = decodeURIComponent(path.slice('/api/daemons/'.length, -'/signal'.length));
+    if (!CONFIG.daemons[key]) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'Daemon not found' })); return; }
+    parseBody(req).then((body) => {
+      try {
+        const ALLOWED_SIGNALS = ['SIGUSR1', 'SIGUSR2', 'SIGHUP', 'SIGTERM'];
+        if (!ALLOWED_SIGNALS.includes(body.signal)) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'Invalid signal' })); return; }
+        daemonManager.signal(key, body.signal);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: String(e) }));
+      }
+    });
+    return;
+  }
+
+  // GET /api/daemons/:key/stream — SSE live tail of stdout log
+  if (req.method === 'GET' && path.match(/^\/api\/daemons\/[^/]+\/stream$/)) {
+    const key = decodeURIComponent(path.slice('/api/daemons/'.length, -'/stream'.length));
+    const cfg = CONFIG.daemons[key];
+    if (!cfg) { res.writeHead(404); res.end('Daemon not found'); return; }
+    const { logFile } = daemonLogPaths(key, cfg);
+    res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+    res.write(`data: ${JSON.stringify({ line: `--- streaming ${key} stdout ---` })}\n\n`);
+    const child = spawn('tail', ['-f', '-n', '50', logFile]);
+    const send = (line) => { if (line.trim()) res.write(`data: ${JSON.stringify({ line })}\n\n`); };
+    child.stdout.on('data', (c) => c.toString().split('\n').forEach(send));
+    child.stderr.on('data', (c) => c.toString().split('\n').forEach(send));
+    req.on('close', () => { try { child.kill('SIGTERM'); } catch {} });
+    return;
+  }
+
+  // GET /api/daemons/:key/logs — last N lines of stdout log
+  if (req.method === 'GET' && path.match(/^\/api\/daemons\/[^/]+\/logs$/)) {
+    const key = decodeURIComponent(path.slice('/api/daemons/'.length, -'/logs'.length));
+    const cfg = CONFIG.daemons[key];
+    if (!cfg) { res.writeHead(404); res.end('Daemon not found'); return; }
+    const lines = Math.min(parseInt(urlObj.searchParams.get('lines') || '80', 10) || 80, 500);
+    const { logFile } = daemonLogPaths(key, cfg);
+    try {
+      const out = execSync(`tail -n ${lines} ${JSON.stringify(logFile)} 2>/dev/null || echo "(no logs yet)"`, { encoding: 'utf-8', timeout: 5000 });
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end(out);
+    } catch (e) {
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end(String(e.message || e));
+    }
+    return;
+  }
+
+  // GET /api/daemons/:key/errlog — last N lines of stderr log
+  if (req.method === 'GET' && path.match(/^\/api\/daemons\/[^/]+\/errlog$/)) {
+    const key = decodeURIComponent(path.slice('/api/daemons/'.length, -'/errlog'.length));
+    const cfg = CONFIG.daemons[key];
+    if (!cfg) { res.writeHead(404); res.end('Daemon not found'); return; }
+    const lines = Math.min(parseInt(urlObj.searchParams.get('lines') || '80', 10) || 80, 500);
+    const { errFile } = daemonLogPaths(key, cfg);
+    try {
+      const out = execSync(`tail -n ${lines} ${JSON.stringify(errFile)} 2>/dev/null || echo "(no stderr logs)"`, { encoding: 'utf-8', timeout: 5000 });
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end(out);
+    } catch (e) {
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end(String(e.message || e));
+    }
+    return;
+  }
+
+  // GET /api/daemons/:key — single daemon summary
+  if (req.method === 'GET' && path.match(/^\/api\/daemons\/[^/]+$/)) {
+    const key = decodeURIComponent(path.slice('/api/daemons/'.length));
+    if (!CONFIG.daemons[key]) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Daemon not found' })); return; }
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify(daemonManager.getSummary(key)));
+    return;
+  }
+
+  // ── LaunchD API ───────────────────────────────────────────────────────────
+
+  // GET /api/launchd — list all LaunchAgents
+  if (req.method === 'GET' && path === '/api/launchd') {
+    invalidateLaunchdCache();
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ agents: listLaunchAgents() }));
+    return;
+  }
+
+  // GET /api/launchd/:label/logs — tail stdout log
+  if (req.method === 'GET' && path.match(/^\/api\/launchd\/[^/]+\/logs$/)) {
+    const label = decodeURIComponent(path.slice('/api/launchd/'.length, -'/logs'.length));
+    const agents = listLaunchAgents();
+    const agent = agents.find((a) => a.label === label);
+    if (!agent) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'Agent not found' })); return; }
+    const logPath = agent.stdoutPath;
+    if (!logPath) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ lines: [], logPath: null, note: 'No log path configured' }));
+      return;
+    }
+    const nLines = Math.min(parseInt(urlObj.searchParams.get('lines') || '80', 10) || 80, 500);
+    try {
+      const out = execSync(`tail -n ${nLines} ${JSON.stringify(logPath)} 2>/dev/null`, { encoding: 'utf-8', timeout: 5000 });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ lines: out.split('\n').filter(Boolean), logPath }));
+    } catch (e) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ lines: [], logPath, error: String(e.message) }));
+    }
+    return;
+  }
+
+  // POST /api/launchd/:label/action — DEPRECATED (410 Gone)
+  if (req.method === 'POST' && path.match(/^\/api\/launchd\/[^/]+\/action$/)) {
+    const label = decodeURIComponent(path.slice('/api/launchd/'.length, -'/action'.length));
+    res.writeHead(410, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Deprecated endpoint', migration: `Use POST /api/items/launchd/${label}/action with body { cmd }`, docs: 'GET /api' }));
+    return;
+  }
+
+  // PATCH /api/launchd/:label — update UI overrides (title, color, group, icon)
+  if (req.method === 'PATCH' && path.match(/^\/api\/launchd\/[^/]+$/)) {
+    const label = decodeURIComponent(path.slice('/api/launchd/'.length));
+    parseBody(req).then((body) => {
+      const key = `launchd:${label}`;
+      if (!CONFIG.entries[key]) CONFIG.entries[key] = {};
+      for (const [k, v] of Object.entries(body)) {
+        if (v === null || v === '') delete CONFIG.entries[key][k];
+        else CONFIG.entries[key][k] = v;
+      }
+      if (Object.keys(CONFIG.entries[key]).length === 0) delete CONFIG.entries[key];
+      saveConfig();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }).catch((e) => {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: String(e) }));
+    });
+    return;
+  }
+
+  // GET /api/launchd/:label — single agent
+  if (req.method === 'GET' && path.match(/^\/api\/launchd\/[^/]+$/)) {
+    const label = decodeURIComponent(path.slice('/api/launchd/'.length));
+    invalidateLaunchdCache();
+    const agent = listLaunchAgents().find((a) => a.label === label);
+    if (!agent) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Agent not found' })); return; }
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify(agent));
+    return;
+  }
+
+  // ── Cron API ──────────────────────────────────────────────────────────────
+
+  // GET /api/crons — list all crontab entries with metadata
+  if (req.method === 'GET' && path === '/api/crons') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ crons: parseCrontab() }));
+    return;
+  }
+
+  // GET /api/crons/:id — single cron entry
+  if (req.method === 'GET' && path.match(/^\/api\/crons\/[^/]+$/)) {
+    const id = decodeURIComponent(path.slice('/api/crons/'.length));
+    const entry = parseCrontab().find((e) => e.id === id);
+    if (!entry) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Cron entry not found' })); return; }
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify(entry));
+    return;
+  }
+
+  // POST /api/crons/:id/action — DEPRECATED (410 Gone)
+  if (req.method === 'POST' && path.match(/^\/api\/crons\/[^/]+\/action$/)) {
+    const id = decodeURIComponent(path.slice('/api/crons/'.length, -'/action'.length));
+    res.writeHead(410, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Deprecated endpoint', migration: `Use POST /api/items/cron/${id}/action with body { cmd }`, docs: 'GET /api' }));
+    return;
+  }
+
+  // PATCH /api/crons/:id — update UI overrides (title, color, group, icon)
+  if (req.method === 'PATCH' && path.match(/^\/api\/crons\/[^/]+$/)) {
+    const id = decodeURIComponent(path.slice('/api/crons/'.length));
+    parseBody(req).then((body) => {
+      const key = `cron:${id}`;
+      if (!CONFIG.entries[key]) CONFIG.entries[key] = {};
+      for (const [k, v] of Object.entries(body)) {
+        if (v === null || v === '') delete CONFIG.entries[key][k];
+        else CONFIG.entries[key][k] = v;
+      }
+      if (Object.keys(CONFIG.entries[key]).length === 0) delete CONFIG.entries[key];
+      saveConfig();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }).catch((e) => {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: String(e) }));
+    });
+    return;
+  }
+
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Not found', hint: 'GET /api for documentation, GET /api/docs for HTML docs' }));
 }
 
 // ── Start ──────────────────────────────────────────────────────────────────
 
-const server = http.createServer(handleRequest);
-server.listen(PORT, HOST, () => {
-  console.log(`\n  pm2 Manager`);
-  console.log(`  ─────────────────────────────────────`);
-  console.log(`  Local:   http://localhost:${PORT}`);
-  console.log(`  Proxy:   http://local.${PORT}.run`);
-  console.log(`  Root:    http://localhost (via nginx)`);
-  console.log(`  API:     http://localhost:${PORT}/api`);
-  console.log(`  ─────────────────────────────────────\n`);
-});
+if (process.env.PM2_MANAGE_TEST) {
+  // Export pure functions for unit testing — server does NOT start
+  module.exports = {
+    _cronId, _parseCronLine, parseCrontab,
+    cronNextRun, cronToHuman, formatTimeUntil,
+    _launchdSchedule,
+    _readCrontabLines, setCronEnabled,
+  };
+} else {
+  const server = http.createServer(handleRequest);
+  server.listen(PORT, HOST, () => {
+    console.log(`\n  pm2 Manager`);
+    console.log(`  ─────────────────────────────────────`);
+    console.log(`  Local:   http://localhost:${PORT}`);
+    console.log(`  Proxy:   http://local.${PORT}.run`);
+    console.log(`  Root:    http://localhost (via nginx)`);
+    console.log(`  API:     http://localhost:${PORT}/api`);
+    console.log(`  ─────────────────────────────────────\n`);
+  });
+}
