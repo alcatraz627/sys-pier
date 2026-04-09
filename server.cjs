@@ -1219,7 +1219,7 @@ function renderDaemonCard(key, summary) {
     <span class="badge ${status}" title="${escHtml(statusTip)}">${status}</span>
   </div>
   <div class="card-body">
-    <div class="cwd" title="${escHtml(summary.command)}" style="font-family:monospace;font-size:0.68rem;color:var(--text-faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 0">${escHtml(cmdShort)}</div>
+    <div class="cwd" title="${escHtml(summary.command)}" style="font-family:var(--font-mono);font-size:0.68rem;color:var(--text-faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 0">${escHtml(cmdShort)}</div>
     <div class="stats-row">
       <div class="stat" title="Time since daemon started"><span class="stat-label">uptime</span><span class="stat-val">${summary.uptime_human || '—'}</span></div>
       <div class="stat" title="CPU % sampled via ps"><span class="stat-label">cpu</span><span class="stat-val">${cpu}</span></div>
@@ -1283,9 +1283,9 @@ function renderCronCard(entry) {
     <span class="badge ${status}" title="${enabled ? 'Active cron job' : 'Disabled'}">${status}</span>
   </div>
   <div class="card-body">
-    <div class="cwd" title="${escHtml(command)}" style="font-family:monospace;font-size:0.68rem;color:var(--text-faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 0">${escHtml(cmdShort)}</div>
+    <div class="cwd" title="${escHtml(command)}" style="font-family:var(--font-mono);font-size:0.68rem;color:var(--text-faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 0">${escHtml(cmdShort)}</div>
     <div class="stats-row">
-      <div class="stat" title="Cron schedule expression"><span class="stat-label">schedule</span><span class="stat-val" style="font-size:0.6rem;font-family:monospace">${escHtml(schedule)}</span></div>
+      <div class="stat" title="Cron schedule expression"><span class="stat-label">schedule</span><span class="stat-val" style="font-size:0.6rem;font-family:var(--font-mono)">${escHtml(schedule)}</span></div>
       <div class="stat" title="Time until next scheduled run"><span class="stat-label">next run</span><span class="stat-val">${escHtml(nextStr)}</span></div>
     </div>
     <div style="color:var(--text-faint);font-size:0.65rem;padding:2px 0" title="Human-readable schedule">${escHtml(humanSchedule)}</div>
@@ -1346,7 +1346,7 @@ function renderLaunchdCard(agent) {
     <span class="badge ${status}" title="${escHtml(statusTip)}">${status}</span>
   </div>
   <div class="card-body">
-    <div class="cwd" title="${escHtml(command)}" style="font-family:monospace;font-size:0.68rem;color:var(--text-faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 0">${escHtml(cmdShort)}</div>
+    <div class="cwd" title="${escHtml(command)}" style="font-family:var(--font-mono);font-size:0.68rem;color:var(--text-faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 0">${escHtml(cmdShort)}</div>
     <div class="stats-row">
       <div class="stat" title="Process ID (if running)"><span class="stat-label">pid</span><span class="stat-val">${pid || '—'}</span></div>
       <div class="stat" title="Trigger / schedule"><span class="stat-label">trigger</span><span class="stat-val" style="font-size:0.65rem">${escHtml(scheduleStr)}</span></div>
@@ -2681,9 +2681,11 @@ function renderPage(processes) {
       vertical-align: middle;
       flex-shrink: 0;
     }
-    .type-badge--daemon  { background: #1a3a6e; color: #79c0ff; border: 1px solid #2a5299; }
-    .type-badge--cron    { background: #3a2a00; color: #f0a050; border: 1px solid #6a4a00; }
-    .type-badge--launchd { background: #2a1a3a; color: #c09aff; border: 1px solid #4a2a6a; }
+    .type-badge--daemon, .type-badge--cron, .type-badge--launchd {
+      background: var(--bg-tertiary);
+      color: var(--text-muted);
+      border: 1px solid var(--border);
+    }
 
     /* ── Proc icon (emoji displayed before name in daemon cards) ──────── */
     .proc-icon { font-size: 0.85rem; line-height: 1; margin-right: 1px; flex-shrink: 0; }
@@ -3387,11 +3389,13 @@ function renderPage(processes) {
       transition: background 0.12s, color 0.12s;
     }
     /* Per-tab color tokens — shared by hover + active */
-    .type-tab[data-filter-type="all"]     { --tc: var(--text-secondary); --tbg: var(--bg-tertiary); }
-    .type-tab[data-filter-type="server"]  { --tc: var(--green);   --tbg: var(--green-bg); }
-    .type-tab[data-filter-type="daemon"]  { --tc: var(--warning); --tbg: var(--warning-bg); }
-    .type-tab[data-filter-type="cron"]    { --tc: var(--accent);  --tbg: var(--accent-bg); }
-    .type-tab[data-filter-type="launchd"] { --tc: var(--danger);  --tbg: var(--danger-bg); }
+    /* Type tabs: neutral only — type identity carries no severity signal */
+    .type-tab[data-filter-type="all"],
+    .type-tab[data-filter-type="server"],
+    .type-tab[data-filter-type="daemon"],
+    .type-tab[data-filter-type="cron"],
+    .type-tab[data-filter-type="launchd"] { --tc: var(--text-secondary); --tbg: var(--bg-tertiary); }
+    /* Status tabs: semantic color valid — online/errored maps to ok/danger */
     .status-tab[data-filter-status="all"]     { --tc: var(--text-secondary); --tbg: var(--bg-tertiary); }
     .status-tab[data-filter-status="online"]  { --tc: var(--green);   --tbg: var(--green-bg); }
     .status-tab[data-filter-status="stopped"] { --tc: var(--text-muted); --tbg: var(--bg-tertiary); }
@@ -3403,8 +3407,15 @@ function renderPage(processes) {
       border-color: var(--tc);
       opacity: 0.75;
     }
-    /* Active: full color */
-    .type-tab.active, .status-tab.active {
+    /* Active: surface lift + bottom border for type tabs; full color for status tabs */
+    .type-tab.active {
+      color: var(--text-primary, var(--text-secondary));
+      background: var(--bg-tertiary);
+      border-color: var(--border-strong, var(--text-secondary));
+      border-bottom: 2px solid var(--text-secondary);
+      opacity: 1;
+    }
+    .status-tab.active {
       color: var(--tc);
       background: var(--tbg);
       border-color: var(--tc);
@@ -5537,7 +5548,7 @@ function renderPage(processes) {
         td1.style.cssText = 'color:var(--text-faint);width:80px;padding:3px 8px 3px 0;vertical-align:top;white-space:nowrap';
         td1.textContent = lbl;
         const td2 = document.createElement('td');
-        td2.style.cssText = 'padding:3px 0;font-family:monospace;word-break:break-all;font-size:0.75rem';
+        td2.style.cssText = 'padding:3px 0;font-family:var(--font-mono);word-break:break-all;font-size:0.75rem';
         td2.textContent = val;
         tr.appendChild(td1); tr.appendChild(td2); table.appendChild(tr);
       }
@@ -5646,7 +5657,7 @@ function renderPage(processes) {
         td1.style.cssText = 'color:var(--text-faint);width:90px;padding:4px 8px 4px 0;vertical-align:top;white-space:nowrap';
         td1.textContent = label;
         const td2 = document.createElement('td');
-        td2.style.cssText = 'padding:4px 0;font-family:monospace;word-break:break-all';
+        td2.style.cssText = 'padding:4px 0;font-family:var(--font-mono);word-break:break-all';
         td2.textContent = val;
         tr.appendChild(td1); tr.appendChild(td2); table.appendChild(tr);
       }
