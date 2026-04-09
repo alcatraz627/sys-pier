@@ -3231,6 +3231,43 @@ function renderPage(processes) {
     .tbl-sort-btn:hover { color: var(--accent); }
     .tbl-sort-btn.sorted-asc::after  { content: ' ▲'; color: var(--accent); }
     .tbl-sort-btn.sorted-desc::after { content: ' ▼'; color: var(--accent); }
+    .clear-filters-chip {
+      padding: 2px 8px 2px 6px;
+      border-radius: 10px;
+      border: 1px solid var(--border-subtle);
+      background: transparent;
+      color: var(--text-secondary);
+      font-size: 0.66rem;
+      font-family: inherit;
+      cursor: pointer;
+      white-space: nowrap;
+      margin-left: 0.25rem;
+      transition: background 0.12s, color 0.12s, border-color 0.12s;
+      letter-spacing: 0.02em;
+    }
+    .clear-filters-chip:hover {
+      background: var(--danger);
+      color: #fff;
+      border-color: var(--danger);
+    }
+    .type-tab.active[data-filter-type]:not([data-filter-type="all"])::before {
+      content: '';
+      display: inline-block;
+      width: 5px; height: 5px;
+      border-radius: 50%;
+      background: var(--accent);
+      margin-right: 4px;
+      vertical-align: middle;
+    }
+    .status-tab.active[data-filter-status]:not([data-filter-status="all"])::before {
+      content: '';
+      display: inline-block;
+      width: 5px; height: 5px;
+      border-radius: 50%;
+      background: var(--accent);
+      margin-right: 4px;
+      vertical-align: middle;
+    }
     .process-table {
       width: 100%;
       border-collapse: collapse;
@@ -3823,6 +3860,7 @@ function renderPage(processes) {
         <option value="type">Type</option>
         <option value="restarts-desc">Restarts ↓</option>
       </select>
+      <button class="clear-filters-chip" id="clear-filters-chip" onclick="clearFilters()" title="Reset all filters" style="display:none">✕ Clear</button>
     </div>
   </div>
 
@@ -4634,6 +4672,8 @@ function renderPage(processes) {
           section.style.display = anyVisible ? '' : 'none';
         });
       }
+
+      _updateClearChip();
     }
 
     function _updateFilterCounts() {
@@ -4714,6 +4754,30 @@ function renderPage(processes) {
 
     // applySearch kept as the oninput target — delegates to applyFilters
     function applySearch(q) {
+      applyFilters();
+    }
+
+    function _isFilterDefault() {
+      const term = document.getElementById('search-input').value.trim();
+      const typeDefault  = activeTypeFilter.size === 1   && activeTypeFilter.has('all');
+      const statusDefault = activeStatusFilter.size === 1 && activeStatusFilter.has('all');
+      return typeDefault && statusDefault && !term;
+    }
+
+    function _updateClearChip() {
+      const chip = document.getElementById('clear-filters-chip');
+      if (chip) chip.style.display = _isFilterDefault() ? 'none' : '';
+    }
+
+    function clearFilters() {
+      activeTypeFilter   = new Set(['all']);
+      activeStatusFilter = new Set(['all']);
+      _saveFilterSet('pm2-type-filter',   activeTypeFilter);
+      _saveFilterSet('pm2-status-filter', activeStatusFilter);
+      _syncTabActive('.type-tab',   activeTypeFilter);
+      _syncTabActive('.status-tab', activeStatusFilter);
+      const si = document.getElementById('search-input');
+      if (si) si.value = '';
       applyFilters();
     }
 
