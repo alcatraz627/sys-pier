@@ -3302,7 +3302,7 @@ function renderPage(processes) {
     .process-table td {
       padding: 5px 10px;
       border-bottom: 1px solid var(--border-subtle);
-      color: var(--text-secondary);
+      color: var(--text-primary);
       vertical-align: middle;
       white-space: nowrap;
     }
