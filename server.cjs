@@ -1272,7 +1272,7 @@ function renderCronCard(entry) {
 
   const primaryActions = enabled
     ? `<button class="btn btn-ok action-btn" onclick="doCronAction('run-now','${escHtml(id)}',this)" title="Run this command immediately">▶ Run Now</button>
-       <button class="btn action-btn" onclick="doCronAction('disable','${escHtml(id)}',this)" title="Comment out this cron entry">⏸ Disable</button>`
+       <button class="btn btn-warn action-btn" onclick="doCronAction('disable','${escHtml(id)}',this)" title="Comment out this cron entry">⏸ Disable</button>`
     : `<button class="btn btn-ok action-btn" onclick="doCronAction('enable','${escHtml(id)}',this)" title="Uncomment this cron entry">▶ Enable</button>`;
 
   return `<div class="card card-enter" data-status="${status}" data-name="${escHtml(`cron:${id}`)}" data-type="cron" style="${colorStyle}">
@@ -3250,9 +3250,9 @@ function renderPage(processes) {
     .clear-filters-chip {
       padding: 2px 8px 2px 6px;
       border-radius: 10px;
-      border: 1px solid var(--border-subtle);
-      background: transparent;
-      color: var(--text-secondary);
+      border: 1px solid var(--danger);
+      background: var(--danger-bg);
+      color: var(--danger);
       font-size: 0.66rem;
       font-family: inherit;
       cursor: pointer;
