@@ -2943,7 +2943,7 @@ function renderPage(processes) {
     }
     .info-row:last-child { border-bottom: none; }
     .info-key { color: var(--text-faint); flex-shrink: 0; width: 130px; }
-    .info-val { color: var(--text-secondary); word-break: break-all; flex: 1; }
+    .info-val { color: var(--text-primary); word-break: break-all; flex: 1; }
     .info-val.online  { color: var(--green); }
     .info-val.stopped { color: var(--text-faint); }
     .info-val.errored { color: var(--danger); }
