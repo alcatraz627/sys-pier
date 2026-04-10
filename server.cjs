@@ -24,6 +24,11 @@ const { execSync, exec, spawn } = require('child_process');
 const os = require('os');
 const fs = require('fs');
 
+// Guarantee full PATH for all shell commands — pm2 LaunchAgent runs with a stripped PATH
+// that may omit /opt/homebrew/bin (pm2, brew tools) and even /usr/bin (id, crontab).
+const EXEC_ENV = { ...process.env, PATH: '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin' };
+function run(cmd, opts = {}) { return execSync(cmd, { env: EXEC_ENV, ...opts }); }
+
 const PORT = process.env.PORT_BACKEND || 5042;
 const HOST = '127.0.0.1'; // localhost-only; blocks all external access at OS level
 
@@ -174,7 +179,7 @@ function runProjectScan() {
   // Collect currently managed working directories
   const managedDirs = new Set();
   try {
-    const ps = JSON.parse(execSync('pm2 jlist', { encoding: 'utf-8', timeout: 10000 }));
+    const ps = JSON.parse(run('pm2 jlist', { encoding: 'utf-8', timeout: 10000 }));
     ps.forEach(p => { if (p.pm2_env?.pm_cwd) managedDirs.add(p.pm2_env.pm_cwd); });
   } catch {}
 
@@ -353,7 +358,7 @@ function isLocalRequest(req) {
 
 function pm2List() {
   try {
-    const raw = execSync('pm2 jlist', { encoding: 'utf-8', timeout: 8000 });
+    const raw = run('pm2 jlist', { encoding: 'utf-8', timeout: 8000 });
     return JSON.parse(raw);
   } catch {
     return [];
@@ -589,7 +594,7 @@ const daemonManager = (() => {
     const r = runtime[key];
     if (!r?.pid) return { cpu: 0, mem: 0 };
     try {
-      const raw = execSync(`ps -p ${r.pid} -o %cpu=,rss=`, { encoding: 'utf-8', timeout: 2000 }).trim();
+      const raw = run(`ps -p ${r.pid} -o %cpu=,rss=`, { encoding: 'utf-8', timeout: 2000 }).trim();
       const parts = raw.trim().split(/\s+/);
       const cpu = parseFloat(parts[0]) || 0;
       const mem = (parseInt(parts[1], 10) || 0) * 1024; // rss in KB → bytes
@@ -666,7 +671,7 @@ function _cronId(schedule, command) {
 
 function _readCrontabLines() {
   try {
-    return execSync('crontab -l 2>/dev/null', { encoding: 'utf-8', timeout: 5000 }).split('\n');
+    return run('crontab -l 2>/dev/null', { encoding: 'utf-8', timeout: 5000 }).split('\n');
   } catch { return []; }
 }
 
@@ -869,7 +874,7 @@ const _LAUNCHD_CACHE_TTL = 8000; // 8s — avoid hammering plist reads every 5s 
 
 function _parsePlist(filePath) {
   try {
-    const out = execSync(
+    const out = run(
       `python3 -c "import plistlib,json,sys; d=plistlib.loads(open(sys.argv[1],'rb').read()); print(json.dumps(d))" ${JSON.stringify(filePath)}`,
       { encoding: 'utf-8', timeout: 5000 }
     );
@@ -879,10 +884,10 @@ function _parsePlist(filePath) {
 
 function _launchdStatus(label) {
   try {
-    const uid = execSync('id -u', { encoding: 'utf-8' }).trim();
+    const uid = run('id -u', { encoding: 'utf-8' }).trim();
     // Use `launchctl print gui/<uid>/<label>` — works from any session context (incl. daemons)
     // Unlike `launchctl list`, this queries the GUI domain explicitly
-    const out = execSync(`launchctl print gui/${uid}/${label} 2>/dev/null`, { encoding: 'utf-8', timeout: 3000 });
+    const out = run(`launchctl print gui/${uid}/${label} 2>/dev/null`, { encoding: 'utf-8', timeout: 3000 });
     const pid = (out.match(/^\s+pid\s*=\s*(\d+)/m) || [])[1];
     const exitMatch = out.match(/^\s+last exit code\s*=\s*(-?\d+)/m);
     const exitCode = exitMatch ? exitMatch[1] : null;
@@ -980,12 +985,12 @@ function listLaunchAgents() {
 function invalidateLaunchdCache() { _LAUNCHD_CACHE.ts = 0; }
 
 function doLaunchctl(action, label, plistPath) {
-  const uid = execSync('id -u', { encoding: 'utf-8' }).trim();
+  const uid = run('id -u', { encoding: 'utf-8' }).trim();
   const actions = {
-    load:      () => execSync(`launchctl load ${JSON.stringify(plistPath)}`, { timeout: 10000 }),
-    unload:    () => execSync(`launchctl unload ${JSON.stringify(plistPath)}`, { timeout: 10000 }),
-    kickstart: () => execSync(`launchctl kickstart -k gui/${uid}/${label}`, { timeout: 10000 }),
-    stop:      () => execSync(`launchctl stop ${label}`, { timeout: 10000 }),
+    load:      () => run(`launchctl load ${JSON.stringify(plistPath)}`, { timeout: 10000 }),
+    unload:    () => run(`launchctl unload ${JSON.stringify(plistPath)}`, { timeout: 10000 }),
+    kickstart: () => run(`launchctl kickstart -k gui/${uid}/${label}`, { timeout: 10000 }),
+    stop:      () => run(`launchctl stop ${label}`, { timeout: 10000 }),
   };
   if (!actions[action]) throw new Error(`Unknown launchctl action: ${action}`);
   actions[action]();
@@ -1720,7 +1725,7 @@ const ITEM_ADAPTERS = {
       const ALLOWED = ['restart','reload','stop','start','delete','flush','reset'];
       if (!ALLOWED.includes(cmd) || !validateName(name)) return { ok: false, error: 'invalid command or name' };
       try {
-        execSync(`pm2 ${cmd} ${JSON.stringify(name)}`, { timeout: 15000 });
+        run(`pm2 ${cmd} ${JSON.stringify(name)}`, { timeout: 15000 });
         return { ok: true };
       } catch (e) { return { ok: false, error: e.message }; }
     },
@@ -1733,7 +1738,7 @@ const ITEM_ADAPTERS = {
       const name  = id.replace(/^pm2:/, '');
       const lines = Math.min(opts.lines || 80, 500);
       try {
-        return execSync(`pm2 logs ${JSON.stringify(name)} --lines ${lines} --nostream --raw 2>&1`, { encoding: 'utf-8', timeout: 10000 });
+        return run(`pm2 logs ${JSON.stringify(name)} --lines ${lines} --nostream --raw 2>&1`, { encoding: 'utf-8', timeout: 10000 });
       } catch (e) { return String(e.message || e); }
     },
   },
@@ -1785,8 +1790,8 @@ const ITEM_ADAPTERS = {
       const key = id.replace(/^merge:/, '');
       const pNames = (CONFIG.merges || {})[key] || [];
       try {
-        if (cmd === 'restart') { for (const n of pNames) execSync(`pm2 restart ${JSON.stringify(n)}`, { timeout: 15000 }); }
-        else if (cmd === 'start') { for (const n of pNames) execSync(`pm2 start ${JSON.stringify(n)}`, { timeout: 15000 }); }
+        if (cmd === 'restart') { for (const n of pNames) run(`pm2 restart ${JSON.stringify(n)}`, { timeout: 15000 }); }
+        else if (cmd === 'start') { for (const n of pNames) run(`pm2 start ${JSON.stringify(n)}`, { timeout: 15000 }); }
         else return { ok: false, error: `Unknown cmd: ${cmd}` };
         return { ok: true };
       } catch (e) { return { ok: false, error: e.message }; }
@@ -1798,7 +1803,7 @@ const ITEM_ADAPTERS = {
       const lines = Math.min(opts.lines || 80, 500);
       try {
         return pNames.map(n =>
-          execSync(`pm2 logs ${JSON.stringify(n)} --lines ${lines} --nostream --raw 2>&1`, { encoding: 'utf-8', timeout: 10000 })
+          run(`pm2 logs ${JSON.stringify(n)} --lines ${lines} --nostream --raw 2>&1`, { encoding: 'utf-8', timeout: 10000 })
         ).join('\n');
       } catch (e) { return String(e.message || e); }
     },
@@ -1933,7 +1938,7 @@ const ITEM_ADAPTERS = {
       const { logFile, errFile } = daemonLogPaths(key, cfg);
       const file = stream === 'err' ? errFile : logFile;
       try {
-        return execSync(`tail -n ${lines} ${JSON.stringify(file)} 2>/dev/null || echo "(no logs yet)"`, { encoding: 'utf-8', timeout: 5000 });
+        return run(`tail -n ${lines} ${JSON.stringify(file)} 2>/dev/null || echo "(no logs yet)"`, { encoding: 'utf-8', timeout: 5000 });
       } catch (e) { return String(e.message || e); }
     },
   },
@@ -2070,7 +2075,7 @@ const ITEM_ADAPTERS = {
       if (!logPath) return '(no log path configured)';
       try {
         const lines = Math.min(opts.lines || 80, 500);
-        return execSync(`tail -n ${lines} ${JSON.stringify(logPath)} 2>/dev/null || echo "(no logs yet)"`, { encoding: 'utf-8', timeout: 5000 });
+        return run(`tail -n ${lines} ${JSON.stringify(logPath)} 2>/dev/null || echo "(no logs yet)"`, { encoding: 'utf-8', timeout: 5000 });
       } catch (e) { return String(e.message || e); }
     },
   },
@@ -2485,7 +2490,7 @@ function renderPage(processes) {
       background: var(--accent-bg);
       color: var(--accent);
       font-weight: 600;
-      text-shadow: 0 0 8px rgba(99, 102, 241, 0.3);
+      text-shadow: none;
       opacity: 1;
     }
 
@@ -2524,10 +2529,10 @@ function renderPage(processes) {
       line-height: 1.3;
     }
     .hdr-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+    .hdr-btn svg { display: inline-block; flex-shrink: 0; pointer-events: none; }
     .hdr-btn.primary { border-color: var(--border); }
     .hdr-btn.primary:hover { border-color: var(--accent); color: var(--accent); }
-    .nav-group .hdr-btn.primary { border-color: transparent; }
-    .nav-group .hdr-btn.primary:hover { background: var(--bg-hover); border-color: transparent; color: var(--accent); }
+    .nav-group .hdr-btn.primary:hover { background: var(--bg-hover); border-color: var(--accent); color: var(--accent); }
     .hdr-btn.save:hover { color: var(--green); }
     .hdr-btn.help:hover { color: var(--text-primary); }
     .hdr-btn:focus-visible,
@@ -2541,6 +2546,13 @@ function renderPage(processes) {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
       gap: 0.875rem;
+    }
+    /* In grouped mode the outer #grid hosts .group-section blocks that must
+       each span full width — switch to block layout so they stack vertically */
+    #grid:has(.group-section) {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
     }
 
     /* ── Skeleton loading ───────────────────────────────────────────────── */
@@ -2585,7 +2597,8 @@ function renderPage(processes) {
     }
     .card:hover { border-color: var(--text-muted); box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
     .card[data-status="online"]  { border-left-color: var(--green); }
-    .card[data-status="stopped"] { border-left-color: var(--text-faint); }
+    .card[data-status="stopped"] { border-left-color: var(--text-faint); opacity: 0.72; }
+    .card[data-status="stopped"]:hover { opacity: 1; }
     .card[data-status="errored"] { border-left-color: var(--danger); box-shadow: 0 0 0 1px var(--danger-bg); }
     .card[data-status="launching"] { border-left-color: var(--warning); }
 
@@ -2691,7 +2704,7 @@ function renderPage(processes) {
     .proc-icon { font-size: 0.85rem; line-height: 1; margin-right: 1px; flex-shrink: 0; }
 
     /* ── Card body ──────────────────────────────────────────────────────── */
-    .card-body { padding: 0.625rem 0.875rem 0.5rem; }
+    .card-body { padding: 0.5rem 0.75rem; }
 
     .port-block { display: flex; flex-direction: column; gap: 2px; margin-bottom: 0.625rem; }
 
@@ -2725,7 +2738,7 @@ function renderPage(processes) {
       color: var(--text-faint);
       font-weight: 500;
     }
-    .stat-val { font-size: 0.78rem; color: var(--text-secondary); font-weight: 500; }
+    .stat-val { font-size: 0.78rem; color: var(--text-primary); font-weight: 500; }
     .stat.warn .stat-val { color: var(--warning); font-weight: 600; }
 
     .cwd {
@@ -3213,13 +3226,14 @@ function renderPage(processes) {
 
     /* ── Process table view ─────────────────────────────────────────────── */
     .process-table-wrap { overflow-x: auto; }
-    #table-sections { display: flex; flex-direction: column; gap: 1.25rem; }
+    #table-sections { display: flex; flex-direction: column; gap: 0.75rem; }
     .table-section { border: 1px solid var(--border-subtle); border-radius: 6px; overflow: hidden; }
     .table-section-header {
       display: flex; align-items: center; gap: 0.4rem;
-      padding: 5px 10px;
-      background: var(--bg-secondary);
-      border-bottom: 1px solid var(--border-subtle);
+      padding: 5px 10px 5px 12px;
+      background: var(--bg-tertiary);
+      border-bottom: 1px solid var(--border);
+      border-left: 3px solid var(--accent);
       font-size: 0.68rem; color: var(--text-secondary);
       user-select: none;
     }
@@ -3286,7 +3300,7 @@ function renderPage(processes) {
       white-space: nowrap;
     }
     .process-table td {
-      padding: 7px 10px;
+      padding: 5px 10px;
       border-bottom: 1px solid var(--border-subtle);
       color: var(--text-secondary);
       vertical-align: middle;
@@ -3309,6 +3323,9 @@ function renderPage(processes) {
     .process-table .tbl-port a:hover { text-decoration: underline; }
     .process-table .tbl-warn { color: var(--warning); }
     .process-table .tbl-actions { display: flex; gap: 4px; }
+    .process-table tr .tbl-actions .btn { opacity: 0; transition: opacity 0.15s, color 0.15s, background 0.15s; }
+    .process-table tr:hover .tbl-actions .btn { opacity: 0.55; }
+    .process-table tr .tbl-actions .btn:hover { opacity: 1; }
     .process-table .card-hidden { display: none; }
     .process-table .tbl-group-header td {
       padding: 10px 8px 4px;
@@ -3545,10 +3562,32 @@ function renderPage(processes) {
     }
 
     /* ── Group sections ────────────────────────────────────────────────── */
-    .group-section { margin-bottom: 1.5rem; transition: opacity 0.2s; }
+    .group-section {
+      margin-bottom: 1.25rem;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-secondary);
+      border-radius: var(--radius);
+      padding: 10px 14px 12px;
+      transition: opacity 0.2s, border-color 0.2s, box-shadow 0.2s;
+    }
     .group-section.drag-source { opacity: 0.35; }
-    .group-section.drag-over-top { box-shadow: 0 -3px 0 0 var(--accent); border-radius: var(--radius); }
-    .group-section.drag-over-bottom { box-shadow: 0 3px 0 0 var(--accent); border-radius: var(--radius); }
+    .group-section.drag-over-top {
+      border-top: 2px solid var(--accent);
+      box-shadow: 0 -2px 8px rgba(99,102,241,0.25);
+    }
+    .group-section.drag-over-bottom {
+      border-bottom: 2px solid var(--accent);
+      box-shadow: 0 2px 8px rgba(99,102,241,0.25);
+    }
+    /* Cross-group card drag feedback */
+    .group-section.card-drag-source {
+      border-color: var(--warning);
+      box-shadow: 0 0 0 1px var(--warning), inset 0 0 12px rgba(245,158,11,0.06);
+    }
+    .group-section.card-drag-target {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px var(--accent), inset 0 0 12px rgba(99,102,241,0.08);
+    }
     .group-header .group-drag-handle { opacity: 0; transition: opacity 0.15s; }
     .group-header:hover .group-drag-handle { opacity: 0.5; }
     .group-drag-handle:hover { opacity: 1 !important; }
@@ -3579,11 +3618,12 @@ function renderPage(processes) {
     .group-section.collapsed .group-collapse-btn { transform: none; }
     .group-section .group-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-      gap: 1rem;
-      max-height: 4000px; opacity: 1; overflow: visible;
+      grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+      gap: 0.75rem;
+      max-height: 4000px; opacity: 1;
       transition: max-height 0.35s ease, opacity 0.25s ease, margin-top 0.25s ease;
     }
+    .group-section .group-grid .card { min-width: 0; }
 
     /* ── Merged cards ──────────────────────────────────────────────────── */
     .card-merged .merge-body {
@@ -5004,7 +5044,8 @@ function renderPage(processes) {
           const vis = !q || sf.includes(q);
           html += \`<tr data-id="\${_esc(item.id)}" data-type="\${item.type}" data-status="\${item.statusBucket}" style="display:\${vis?'':'none'}">\`;
           for (const col of cols) {
-            html += \`<td\${col.a ? \` style="text-align:\${col.a}"\` : ''}>\${col.r(item)}</td>\`;
+            const isActionsCol = col.id === 'actions';
+            html += \`<td\${isActionsCol ? ' class="tbl-actions"' : ''}\${col.a ? \` style="text-align:\${col.a}"\` : ''}>\${col.r(item)}</td>\`;
           }
           html += \`</tr>\`;
         }
@@ -5916,27 +5957,40 @@ function renderPage(processes) {
         ]},
         { type: 'nav-sep' },
         // ── Primary actions ──
-        { id: 'save-btn',  label: 'Save',  icon: '💾', key: 's', noMod: true, hint: 'save',
+        { id: 'save-btn',  label: 'Save',
+          icon: '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" style="vertical-align:-2px"><path d="M13 1H3a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2V4l-2-3zM8 13a2 2 0 110-4 2 2 0 010 4zm3-9H4V3h7v1z" fill="currentColor"/></svg>',
+          key: 's', noMod: true, hint: 'save',
           title: 'pm2 save — writes process list to dump (s)',
           className: 'primary save', group: 'actions', action: () => saveList() },
-        { label: '', icon: '⟳',
+        { label: '',
+          icon: '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" style="vertical-align:-2px"><path d="M8 2a6 6 0 100 12A6 6 0 008 2zm.75 8.5h-1.5v-5h1.5v5zm0-6.5h-1.5V2.5h1.5V4z" fill="currentColor"/><path d="M13.5 3.5L15 2l-1 3-3-1 1.5-1.5z" fill="currentColor"/></svg>',
           title: 'pm2 resurrect — restore from last save',
           group: 'actions', action: () => doResurrect() },
-        { id: 'scan-btn', label: 'Scan', icon: '🔍', key: 'd', noMod: true, hint: 'discover',
+        { id: 'scan-btn', label: 'Scan',
+          icon: '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" style="vertical-align:-2px"><circle cx="6.5" cy="6.5" r="4" stroke="currentColor" stroke-width="1.5"/><path d="M10.5 10.5L14 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
+          key: 'd', noMod: true, hint: 'discover',
           title: 'Scan for new projects (d)',
           group: 'actions', action: () => openScanModal() },
-        { id: 'daemon-btn', label: 'Daemon', icon: '🔧', key: 'n', noMod: true, hint: 'new daemon',
+        { id: 'daemon-btn', label: 'Daemon',
+          icon: '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" style="vertical-align:-2px"><path d="M8 1L3 4v4c0 3.3 2.2 6.1 5 7 2.8-.9 5-3.7 5-7V4L8 1z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M6 8l1.5 1.5L10 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+          key: 'n', noMod: true, hint: 'new daemon',
           title: 'Register a new custom daemon (n)',
           group: 'actions', action: () => openCreateDaemonModal() },
         { type: 'nav-sep' },
         // ── Settings ──
-        { id: 'config-btn', label: '', icon: '⚙', key: 'c', noMod: true, hint: 'config',
+        { id: 'config-btn', label: '',
+          icon: '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" style="vertical-align:-2px"><path d="M8 10a2 2 0 100-4 2 2 0 000 4z" fill="currentColor"/><path d="M13.3 8c0-.3 0-.7-.1-1l1.5-1.2-1.5-2.6-1.8.7a5 5 0 00-1.7-1L9.5 1h-3l-.2 1.9a5 5 0 00-1.7 1l-1.8-.7L1.3 5.8 2.8 7A5 5 0 002.7 8c0 .3 0 .7.1 1L1.3 10.2l1.5 2.6 1.8-.7c.5.4 1.1.7 1.7 1l.2 1.9h3l.2-1.9a5 5 0 001.7-1l1.8.7 1.5-2.6L13.2 9c.1-.3.1-.6.1-1z" stroke="currentColor" stroke-width="1.3"/></svg>',
+          key: 'c', noMod: true, hint: 'config',
           title: 'Settings: groups, URLs, merges (c)',
           group: 'settings', action: () => openConfigModal() },
-        { id: 'help-btn', label: '', icon: '?', key: '?', hint: 'help',
+        { id: 'help-btn', label: '',
+          icon: '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" style="vertical-align:-2px"><circle cx="8" cy="8" r="6.5" stroke="currentColor" stroke-width="1.3"/><path d="M6.5 6.5c0-1 .7-1.5 1.5-1.5s1.5.6 1.5 1.5c0 .8-.5 1.2-1 1.5S8 9 8 9.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="8" cy="11.5" r=".75" fill="currentColor"/></svg>',
+          key: '?', hint: 'help',
           title: 'Quick reference (?)',
           className: 'help', group: 'settings', action: () => openHelp() },
-        { id: 'theme-btn', label: '', icon: '🎨', key: 't', noMod: true, hint: 'theme',
+        { id: 'theme-btn', label: '',
+          icon: '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" style="vertical-align:-2px"><circle cx="8" cy="8" r="3" fill="currentColor"/><path d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M3.1 3.1l1.1 1.1M11.8 11.8l1.1 1.1M3.1 12.9l1.1-1.1M11.8 4.2l1.1-1.1" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>',
+          key: 't', noMod: true, hint: 'theme',
           title: 'Color theme (t)',
           alwaysActive: true, group: 'settings', action: () => toggleThemePanel() },
         { type: 'nav-sep' },
@@ -6186,6 +6240,9 @@ function renderPage(processes) {
       const card = e.target.closest('.card') || e.target.closest('tr');
       if (card) {
         card.classList.add('drag-source');
+        // Mark source group with amber border
+        const srcSection = card.closest('.group-section');
+        if (srcSection) srcSection.classList.add('card-drag-source');
         // Create a floating ghost of the card
         if (card.classList.contains('card')) {
           var ghost = card.cloneNode(true);
@@ -6200,6 +6257,15 @@ function renderPage(processes) {
     function clearDragIndicators() {
       document.querySelectorAll('.drag-over-top,.drag-over-bottom').forEach((el) => {
         el.classList.remove('drag-over-top', 'drag-over-bottom');
+      });
+      document.querySelectorAll('.group-section.card-drag-target').forEach((el) => {
+        el.classList.remove('card-drag-target');
+      });
+    }
+
+    function clearCardDragGroupState() {
+      document.querySelectorAll('.group-section.card-drag-source,.group-section.card-drag-target').forEach((el) => {
+        el.classList.remove('card-drag-source', 'card-drag-target');
       });
     }
 
@@ -6217,6 +6283,13 @@ function renderPage(processes) {
           clearDragIndicators();
           const pos = getDragPosition(e, card);
           card.classList.add(pos === 'top' ? 'drag-over-top' : 'drag-over-bottom');
+          // Highlight target group section (if different from source group)
+          const targetSection = card.closest('.group-section');
+          const sourceCard = document.querySelector('.card[data-name="' + CSS.escape(dragSourceName) + '"]');
+          const srcSection = sourceCard ? sourceCard.closest('.group-section') : null;
+          if (targetSection && targetSection !== srcSection) {
+            targetSection.classList.add('card-drag-target');
+          }
         });
         card.addEventListener('dragleave', (e) => {
           if (!card.contains(e.relatedTarget)) {
@@ -6227,6 +6300,7 @@ function renderPage(processes) {
           e.preventDefault();
           const pos = getDragPosition(e, card);
           clearDragIndicators();
+          clearCardDragGroupState();
           const target = card.dataset.name;
           if (!dragSourceName || dragSourceName === target) return;
           // Instant DOM reorder (optimistic update) with flash animation
@@ -6255,19 +6329,44 @@ function renderPage(processes) {
           card.classList.remove('drag-source');
           dragSourceName = null;
           clearDragIndicators();
+          clearCardDragGroupState();
         });
       });
     }
 
     // ── Group section reorder ──────────────────────────────────────────
     var _dragGroupId = null;
+    var _groupPlaceholder = null;
+
+    // Assign unique view-transition-name to each group section for smooth FLIP
+    function _assignGroupTransitionNames() {
+      document.querySelectorAll('.group-section[data-group]').forEach(function(s) {
+        var safe = 'gs-' + s.dataset.group.replace(/[^a-z0-9-]/gi, '-');
+        s.style.viewTransitionName = safe;
+      });
+    }
+
+    function _clearGroupDragState() {
+      _dragGroupId = null;
+      if (_groupPlaceholder) { _groupPlaceholder.remove(); _groupPlaceholder = null; }
+      document.querySelectorAll('.group-section.drag-over-top,.group-section.drag-over-bottom,.group-section.drag-source').forEach(function(el) {
+        el.classList.remove('drag-over-top', 'drag-over-bottom', 'drag-source');
+      });
+    }
 
     function onGroupSectionDragStart(e, gid) {
       _dragGroupId = gid;
       e.dataTransfer.effectAllowed = 'move';
       e.dataTransfer.setData('text/plain', 'group:' + gid);
       var section = e.target.closest('.group-section');
-      if (section) section.classList.add('drag-source');
+      if (section) {
+        section.classList.add('drag-source');
+        // Create a height-matched placeholder so other groups don't jump
+        _groupPlaceholder = document.createElement('div');
+        _groupPlaceholder.className = 'group-section-placeholder';
+        _groupPlaceholder.style.cssText = 'height:' + section.offsetHeight + 'px;border:2px dashed var(--border);border-radius:var(--radius);background:var(--bg-inset);opacity:0.5;flex-shrink:0;';
+        _groupPlaceholder.dataset.placeholder = '1';
+      }
     }
 
     // Attach via delegation on #grid
@@ -6277,7 +6376,7 @@ function renderPage(processes) {
       grid.addEventListener('dragover', function(e) {
         if (!_dragGroupId) return;
         var section = e.target.closest('.group-section');
-        if (!section || section.dataset.group === _dragGroupId) return;
+        if (!section || section.dataset.group === _dragGroupId || section.dataset.placeholder) return;
         e.preventDefault();
         e.dataTransfer.dropEffect = 'move';
         document.querySelectorAll('.group-section.drag-over-top,.group-section.drag-over-bottom').forEach(function(el) {
@@ -6286,27 +6385,35 @@ function renderPage(processes) {
         var rect = section.getBoundingClientRect();
         var pos = (e.clientY - rect.top) < rect.height / 2 ? 'top' : 'bottom';
         section.classList.add(pos === 'top' ? 'drag-over-top' : 'drag-over-bottom');
+        // Move placeholder to show where section will land
+        if (_groupPlaceholder) {
+          if (pos === 'top') section.parentElement.insertBefore(_groupPlaceholder, section);
+          else section.parentElement.insertBefore(_groupPlaceholder, section.nextSibling);
+        }
       });
       grid.addEventListener('drop', async function(e) {
         if (!_dragGroupId) return;
         var targetSection = e.target.closest('.group-section');
-        if (!targetSection || targetSection.dataset.group === _dragGroupId) return;
+        if (!targetSection || targetSection.dataset.group === _dragGroupId || targetSection.dataset.placeholder) return;
         e.preventDefault();
-        document.querySelectorAll('.group-section.drag-over-top,.group-section.drag-over-bottom,.group-section.drag-source').forEach(function(el) {
-          el.classList.remove('drag-over-top', 'drag-over-bottom', 'drag-source');
-        });
         var rect = targetSection.getBoundingClientRect();
         var pos = (e.clientY - rect.top) < rect.height / 2 ? 'top' : 'bottom';
-        // Instant DOM reorder with flash
         var sourceSection = grid.querySelector('.group-section[data-group="' + CSS.escape(_dragGroupId) + '"]');
+        _clearGroupDragState();
         if (sourceSection) {
-          if (pos === 'top') {
-            targetSection.parentElement.insertBefore(sourceSection, targetSection);
+          // Animated reorder via View Transitions API if supported
+          var doReorder = function() {
+            if (pos === 'top') targetSection.parentElement.insertBefore(sourceSection, targetSection);
+            else targetSection.parentElement.insertBefore(sourceSection, targetSection.nextSibling);
+          };
+          if (document.startViewTransition) {
+            _assignGroupTransitionNames();
+            document.startViewTransition(doReorder);
           } else {
-            targetSection.parentElement.insertBefore(sourceSection, targetSection.nextSibling);
+            doReorder();
+            sourceSection.classList.add('reorder-flash');
+            sourceSection.addEventListener('animationend', function handler() { sourceSection.classList.remove('reorder-flash'); sourceSection.removeEventListener('animationend', handler); });
           }
-          sourceSection.classList.add('reorder-flash');
-          sourceSection.addEventListener('animationend', function handler() { sourceSection.classList.remove('reorder-flash'); sourceSection.removeEventListener('animationend', handler); });
         }
         // Persist group order
         var sections = grid.querySelectorAll('.group-section[data-group]');
@@ -6327,14 +6434,8 @@ function renderPage(processes) {
           DASH_CONFIG = await res.json();
           toast('Group order updated', 'ok');
         } catch(e) { toast('Failed to reorder groups', 'err'); }
-        _dragGroupId = null;
       });
-      grid.addEventListener('dragend', function() {
-        _dragGroupId = null;
-        document.querySelectorAll('.group-section.drag-over-top,.group-section.drag-over-bottom,.group-section.drag-source').forEach(function(el) {
-          el.classList.remove('drag-over-top', 'drag-over-bottom', 'drag-source');
-        });
-      });
+      grid.addEventListener('dragend', _clearGroupDragState);
     })();
 
     // ── Table row drag-drop (event delegation on tbody) ───────────────
@@ -7193,7 +7294,7 @@ function handleRequest(req, res) {
 
   if (req.method === 'GET' && path === '/api/info') {
     let pm2Version = 'unknown';
-    try { pm2Version = execSync('pm2 --version', { encoding: 'utf-8', timeout: 3000 }).trim(); } catch {}
+    try { pm2Version = run('pm2 --version', { encoding: 'utf-8', timeout: 3000 }).trim(); } catch {}
     const processes = pm2List();
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({
@@ -7330,7 +7431,7 @@ function handleRequest(req, res) {
     if (!validateName(name)) { res.writeHead(400); res.end('Bad name'); return; }
     const lines = Math.min(parseInt(urlObj.searchParams.get('lines') || '80', 10) || 80, 500);
     try {
-      const out = execSync(`pm2 logs ${JSON.stringify(name)} --lines ${lines} --nostream --raw 2>&1`, { encoding: 'utf-8', timeout: 10000 });
+      const out = run(`pm2 logs ${JSON.stringify(name)} --lines ${lines} --nostream --raw 2>&1`, { encoding: 'utf-8', timeout: 10000 });
       res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end(out);
     } catch (e) {
@@ -7805,7 +7906,7 @@ function handleRequest(req, res) {
           const cmd = buildStartCommand(sel);
           if (!cmd) { results.push({ name: sel.name, ok: false, error: 'No start method found' }); continue; }
           try {
-            const out = execSync(cmd, { encoding: 'utf-8', timeout: 15000, cwd: sel.path });
+            const out = run(cmd, { encoding: 'utf-8', timeout: 15000, cwd: sel.path });
             results.push({ name: sel.name, ok: true, output: out.trim() });
           } catch (err) {
             results.push({ name: sel.name, ok: false, error: err.message });
@@ -8019,7 +8120,7 @@ curl -s -X POST http://localhost:${PORT}/api/groups \\
     const lines = Math.min(parseInt(urlObj.searchParams.get('lines') || '80', 10) || 80, 500);
     const { logFile } = daemonLogPaths(key, cfg);
     try {
-      const out = execSync(`tail -n ${lines} ${JSON.stringify(logFile)} 2>/dev/null || echo "(no logs yet)"`, { encoding: 'utf-8', timeout: 5000 });
+      const out = run(`tail -n ${lines} ${JSON.stringify(logFile)} 2>/dev/null || echo "(no logs yet)"`, { encoding: 'utf-8', timeout: 5000 });
       res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end(out);
     } catch (e) {
@@ -8037,7 +8138,7 @@ curl -s -X POST http://localhost:${PORT}/api/groups \\
     const lines = Math.min(parseInt(urlObj.searchParams.get('lines') || '80', 10) || 80, 500);
     const { errFile } = daemonLogPaths(key, cfg);
     try {
-      const out = execSync(`tail -n ${lines} ${JSON.stringify(errFile)} 2>/dev/null || echo "(no stderr logs)"`, { encoding: 'utf-8', timeout: 5000 });
+      const out = run(`tail -n ${lines} ${JSON.stringify(errFile)} 2>/dev/null || echo "(no stderr logs)"`, { encoding: 'utf-8', timeout: 5000 });
       res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end(out);
     } catch (e) {
@@ -8080,7 +8181,7 @@ curl -s -X POST http://localhost:${PORT}/api/groups \\
     }
     const nLines = Math.min(parseInt(urlObj.searchParams.get('lines') || '80', 10) || 80, 500);
     try {
-      const out = execSync(`tail -n ${nLines} ${JSON.stringify(logPath)} 2>/dev/null`, { encoding: 'utf-8', timeout: 5000 });
+      const out = run(`tail -n ${nLines} ${JSON.stringify(logPath)} 2>/dev/null`, { encoding: 'utf-8', timeout: 5000 });
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ lines: out.split('\n').filter(Boolean), logPath }));
     } catch (e) {
