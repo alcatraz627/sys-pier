@@ -3890,7 +3890,7 @@ function renderPage(processes) {
   <div class="filter-bar" id="filter-bar">
     <div class="type-tabs" id="type-tabs" title="Shift-click to select multiple">
       <button class="type-tab active" data-filter-type="all"     onclick="setTypeFilter('all',event)"><span class="tab-icon">⬡</span>All<span class="tab-count" id="tc-all"></span></button>
-      <button class="type-tab"        data-filter-type="server"  onclick="setTypeFilter('server',event)"><span class="tab-icon">▶</span>pm2<span class="tab-count" id="tc-server"></span></button>
+      <button class="type-tab"        data-filter-type="server"  onclick="setTypeFilter('server',event)"><span class="tab-icon">▶</span>Server<span class="tab-count" id="tc-server"></span></button>
       <button class="type-tab"        data-filter-type="daemon"  onclick="setTypeFilter('daemon',event)"><span class="tab-icon">⚙</span>Daemon<span class="tab-count" id="tc-daemon"></span></button>
       <button class="type-tab"        data-filter-type="cron"    onclick="setTypeFilter('cron',event)"><span class="tab-icon">⏱</span>Cron<span class="tab-count" id="tc-cron"></span></button>
       <button class="type-tab"        data-filter-type="launchd" onclick="setTypeFilter('launchd',event)"><span class="tab-icon">⌘</span>LaunchD<span class="tab-count" id="tc-launchd"></span></button>
@@ -4845,6 +4845,8 @@ function renderPage(processes) {
       const isTable = currentView === 'table';
       var gridEl = document.getElementById('grid');
       var tableEl = document.getElementById('table-wrap');
+      var sortSel = document.getElementById('sort-select');
+      if (sortSel) sortSel.style.display = isTable ? 'none' : '';
       if (navbar) navbar.updateSegToggle('view-seg', isTable ? 'table' : 'cards');
       if (isTable) {
         if (allItems.length) renderTableFromItems(allItems);
