@@ -2389,7 +2389,18 @@ const THEMES = [
 function renderPage(processes) {
   const cards = renderCards(processes);
   const count = processes.length;
-  const themeSwatchesJs = JSON.stringify(Object.fromEntries(THEMES.map((t) => [t.id, t])));
+  // M4 Phase 3a — single bootstrap blob for all JS-context globals.
+  // After this phase, the inline <script> body should NOT contain any
+  // bare ${...} interpolations — only escaped \${...} JS template literals.
+  // JSON.stringify is escape-safe by construction so no template-collision
+  // bug class can fire here.
+  const bootstrap = {
+    config:       CONFIG,
+    colorPalette: COLOR_PALETTE,
+    themes:       Object.fromEntries(THEMES.map((t) => [t.id, t])),
+    themeOrder:   THEMES.map((t) => t.id),
+    processCount: count,
+  };
 
   return `<!DOCTYPE html>
 <html lang="en" data-theme="dark">
@@ -4478,6 +4489,7 @@ function renderPage(processes) {
 
   <div class="hint-bar" id="hint-bar"></div>
 
+  <script>window.__SYS_PIER__ = ${JSON.stringify(bootstrap)};</script>
   <script>
     // ── Client-side console logging ──────────────────────────────────────
     (function() {
@@ -4508,13 +4520,13 @@ function renderPage(processes) {
     // ── Client-side HTML escape ──────────────────────────────────────────
     function _esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
-    // ── Dashboard config (synced from server) ─────────────────────────────
-    let DASH_CONFIG = ${JSON.stringify(CONFIG)};
-    const COLOR_PALETTE = ${JSON.stringify(COLOR_PALETTE)};
+    // ── Dashboard config (synced from server via window.__SYS_PIER__) ────
+    let DASH_CONFIG = window.__SYS_PIER__.config;
+    const COLOR_PALETTE = window.__SYS_PIER__.colorPalette;
 
     // ── Theme system ───────────────────────────────────────────────────────
-    const THEMES = ${themeSwatchesJs};
-    const THEME_ORDER = [${THEMES.map((t) => `'${t.id}'`).join(',')}];
+    const THEMES = window.__SYS_PIER__.themes;
+    const THEME_ORDER = window.__SYS_PIER__.themeOrder;
     const html = document.documentElement;
     let currentTheme = 'dark';
     let themeNavIndex = -1; // -1 = no keyboard focus active
@@ -5531,7 +5543,7 @@ function renderPage(processes) {
       }
     })();
 
-    showSkeletons(${Math.max(count, 3)});
+    showSkeletons(Math.max(window.__SYS_PIER__.processCount, 3));
     refresh();
     setInterval(refresh, 5000);
 
