@@ -4643,8 +4643,10 @@ function renderPage(processes) {
           });
           setupDragDrop();
         } else {
-          // Smart patch: update only changed content within existing cards
-          patchCardsInPlace(data.processes, grid);
+          // Smart patch: update only changed content within existing cards.
+          // Pass tmp so patchCardsInPlace can swap whole cards on status change
+          // (action buttons + advanced controls depend on isOnline server-side).
+          patchCardsInPlace(data.processes, grid, tmp);
           // Also update group headers (emoji, name, count, notes) if in grouped view
           if (grouped) {
             tmp.querySelectorAll('.group-section').forEach(newSection => {
@@ -4707,9 +4709,19 @@ function renderPage(processes) {
 
     // Patch existing card DOM elements in-place using process data,
     // avoiding innerHTML replacement to preserve focus, inputs, and scroll state.
-    function patchCardsInPlace(processes, grid) {
+    function patchCardsInPlace(processes, grid, tmp) {
       const byName = {};
       for (const p of processes) byName[p.name] = p;
+
+      // Lookup of fresh-rendered cards from the parsed response, used to
+      // swap whole cards when status changes. Without this, badge + dot
+      // update via patchSingleCard but action buttons (Start/Stop/Restart)
+      // stay on the old set — making a started process still show "Start"
+      // until full reload.
+      const newCardByName = {};
+      if (tmp) {
+        tmp.querySelectorAll('.card[data-name]').forEach(c => { newCardByName[c.dataset.name] = c; });
+      }
 
       grid.querySelectorAll('.card[data-name]').forEach(card => {
         const name = card.dataset.name;
@@ -4726,7 +4738,18 @@ function renderPage(processes) {
         }
 
         const p = byName[name];
-        if (p) patchSingleCard(card, p);
+        if (!p) return;
+
+        // Status flipped → action buttons + advanced controls need re-render.
+        // Surgical swap from the already-fetched fresh HTML; no extra request.
+        if (card.dataset.status !== p.status && newCardByName[name]) {
+          const fresh = newCardByName[name];
+          fresh.classList.remove('card-enter'); // existing card, no entrance animation
+          card.replaceWith(fresh);
+          return;
+        }
+
+        patchSingleCard(card, p);
       });
     }
 
