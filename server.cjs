@@ -8205,7 +8205,7 @@ function shimLegacyAdapter(legacy) {
 // Types that have a real adapter under adapters/ — skipped by the legacy
 // shim loop. As Phase 2-4 progresses, add to this set; once it covers all
 // types in ITEM_ADAPTERS, the shim and ITEM_ADAPTERS itself can be deleted.
-const MIGRATED_TYPES = new Set(['launchd']);
+const MIGRATED_TYPES = new Set(['launchd', 'static', 'daemon', 'cron']);
 
 function registerLegacyAdapters() {
   for (const legacy of Object.values(ITEM_ADAPTERS)) {
@@ -8216,19 +8216,43 @@ function registerLegacyAdapters() {
 }
 
 function registerRealAdapters() {
+  const safe = (id, factory, deps) => {
+    try { registry.register(factory(deps)); }
+    catch (e) { console.warn(`[m4] ${id} adapter registration failed: ${e.message}`); }
+  };
+
   // launchd — Phase 2 first migration. Pure-parser, no self-reference.
-  try {
-    const createLaunchd = require('./adapters/launchd.cjs');
-    registry.register(createLaunchd({
-      listLaunchAgents,
-      toStatusBucket,
-      doLaunchctl,
-      invalidateLaunchdCache,
-      getConfig: () => CONFIG,
-    }));
-  } catch (e) {
-    console.warn(`[m4] launchd adapter registration failed: ${e.message}`);
-  }
+  safe('launchd', require('./adapters/launchd.cjs'), {
+    listLaunchAgents,
+    toStatusBucket,
+    doLaunchctl,
+    invalidateLaunchdCache,
+    getConfig: () => CONFIG,
+  });
+
+  // static-URL — Phase 4 batch. Config-only, no subprocess.
+  safe('static', require('./adapters/static.cjs'), {
+    getConfig: () => CONFIG,
+    saveConfig,
+  });
+
+  // daemon — Phase 4 batch. Wraps daemonManager.
+  safe('daemon', require('./adapters/daemon.cjs'), {
+    daemonManager,
+    daemonLogPaths,
+    toStatusBucket,
+    getConfig: () => CONFIG,
+    saveConfig,
+    run,
+  });
+
+  // cron — Phase 4 batch. Crontab parser + detached spawn for run-now.
+  safe('cron', require('./adapters/cron.cjs'), {
+    parseCrontab,
+    setCronEnabled,
+    spawn,
+    getConfig: () => CONFIG,
+  });
 }
 
 // ── M4 Phase 1 — generic adapter request handler ──────────────────────────
