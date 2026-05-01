@@ -3,6 +3,9 @@ node_modules/
 
 # User-specific config (contains process details, group settings, order preferences)
 pm2-manage-config.json
+sys-pier-config.json
+*.bak.before-syspier
+daemon-runtime.json
 
 # Environment
 .env
@@ -15,6 +18,16 @@ _precompact-checkpoint.claude.md
 
 # Client browser logs (error auditing)
 client-logs/
+
+# Playwright test artifacts
+tests/screenshots/
+tests/playwright-results/
+.playwright-mcp/
+
+# Scratch screenshots at repo root
+/anim-test-*.png
+/navbar-*.png
+/ui-*.png
 
 # OS files
 .DS_Store
