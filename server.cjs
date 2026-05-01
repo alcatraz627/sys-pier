@@ -8132,6 +8132,48 @@ const API_DOCS = {
 
 // ── Request Handler ────────────────────────────────────────────────────────
 
+// ── M4 Phase 1 — legacy ITEM_ADAPTERS → contract shim ─────────────────────
+// Wraps each entry in ITEM_ADAPTERS to satisfy core/registry.cjs contract.
+// Called once at server start (skipped under PM2_MANAGE_TEST). Existing
+// per-type routes continue to serve their own traffic; shims expose the
+// same data via /api/items/:type. Phase 2+ will replace each shim with
+// a proper adapter module living in adapters/.
+function shimLegacyAdapter(legacy) {
+  const actions = {};
+  for (const cmd of legacy.availableActions || []) {
+    if (typeof legacy.action !== 'function') break;
+    actions[cmd] = {
+      params: {},
+      run: async (id) => legacy.action(id, cmd),
+    };
+  }
+  return {
+    id: legacy.type,
+    cost: 'cheap',
+    schema: () => ({
+      type: legacy.type,
+      icon: legacy.icon,
+      label: legacy.label,
+      tableColumns: legacy.tableColumns,
+    }),
+    stableId: (item) => item && item.id,
+    health: () => ({ ok: true }),
+    list: async () => (typeof legacy.collect === 'function' ? legacy.collect() : []),
+    detail: async (id) => (typeof legacy.detail === 'function' ? legacy.detail(id) : null),
+    actions,
+    // Note: legacy.logs returns a sync string, contract expects AsyncIterable.
+    // Skipping `logs` in the shim — per-type /api/{pm2,daemons,...}/:name/logs
+    // endpoints continue to serve. Phase 2+ adapters will implement properly.
+  };
+}
+
+function registerLegacyAdapters() {
+  for (const legacy of Object.values(ITEM_ADAPTERS)) {
+    try { registry.register(shimLegacyAdapter(legacy)); }
+    catch (e) { console.warn(`[m4] shim registration failed for ${legacy.type}: ${e.message}`); }
+  }
+}
+
 // ── M4 Phase 1 — generic adapter request handler ──────────────────────────
 // Routes:
 //   GET  /api/items                       → { adapters: [id, ...] }
@@ -9744,6 +9786,7 @@ if (process.env.PM2_MANAGE_TEST) {
     _readCrontabLines, setCronEnabled,
   };
 } else {
+  registerLegacyAdapters();
   const server = http.createServer(handleRequest);
   server.listen(PORT, HOST, () => {
     console.log(`\n  sys-pier`);
