@@ -8205,7 +8205,7 @@ function shimLegacyAdapter(legacy) {
 // Types that have a real adapter under adapters/ — skipped by the legacy
 // shim loop. As Phase 2-4 progresses, add to this set; once it covers all
 // types in ITEM_ADAPTERS, the shim and ITEM_ADAPTERS itself can be deleted.
-const MIGRATED_TYPES = new Set(['launchd', 'static', 'daemon', 'cron']);
+const MIGRATED_TYPES = new Set(['launchd', 'static', 'daemon', 'cron', 'pm2', 'merge']);
 
 function registerLegacyAdapters() {
   for (const legacy of Object.values(ITEM_ADAPTERS)) {
@@ -8252,6 +8252,29 @@ function registerRealAdapters() {
     setCronEnabled,
     spawn,
     getConfig: () => CONFIG,
+  });
+
+  // pm2 — Phase 4 LAST. NO_SELF_MANAGE guard inside the adapter prevents
+  // self-destructive actions on sys-pier-backend. See adapters/pm2.cjs.
+  safe('pm2', require('./adapters/pm2.cjs'), {
+    pm2List,
+    pm2Find,
+    summarizeProcess,
+    toStatusBucket,
+    invalidatePm2Cache,
+    validateName,
+    getConfig: () => CONFIG,
+    run,
+  });
+
+  // merge — Virtual cards aggregating pm2 entries. Migrate alongside pm2
+  // since it's a pure derivative of pm2List() + CONFIG.merges.
+  safe('merge', require('./adapters/merge.cjs'), {
+    pm2List,
+    summarizeProcess,
+    invalidatePm2Cache,
+    getConfig: () => CONFIG,
+    run,
   });
 }
 
