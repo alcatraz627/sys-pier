@@ -8190,10 +8190,32 @@ function shimLegacyAdapter(legacy) {
   };
 }
 
+// Types that have a real adapter under adapters/ — skipped by the legacy
+// shim loop. As Phase 2-4 progresses, add to this set; once it covers all
+// types in ITEM_ADAPTERS, the shim and ITEM_ADAPTERS itself can be deleted.
+const MIGRATED_TYPES = new Set(['launchd']);
+
 function registerLegacyAdapters() {
   for (const legacy of Object.values(ITEM_ADAPTERS)) {
+    if (MIGRATED_TYPES.has(legacy.type)) continue;
     try { registry.register(shimLegacyAdapter(legacy)); }
     catch (e) { console.warn(`[m4] shim registration failed for ${legacy.type}: ${e.message}`); }
+  }
+}
+
+function registerRealAdapters() {
+  // launchd — Phase 2 first migration. Pure-parser, no self-reference.
+  try {
+    const createLaunchd = require('./adapters/launchd.cjs');
+    registry.register(createLaunchd({
+      listLaunchAgents,
+      toStatusBucket,
+      doLaunchctl,
+      invalidateLaunchdCache,
+      getConfig: () => CONFIG,
+    }));
+  } catch (e) {
+    console.warn(`[m4] launchd adapter registration failed: ${e.message}`);
   }
 }
 
@@ -9810,6 +9832,7 @@ if (process.env.PM2_MANAGE_TEST) {
   };
 } else {
   registerLegacyAdapters();
+  registerRealAdapters();
   const server = http.createServer(handleRequest);
   server.listen(PORT, HOST, () => {
     console.log(`\n  sys-pier`);
