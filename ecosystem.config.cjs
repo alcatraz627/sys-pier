@@ -1,9 +1,9 @@
-// pm2 ecosystem config — pm2 Manager Dashboard
+// pm2 ecosystem config — sys-pier dashboard
 // Port: 5042 (backend-only, serves dashboard HTML + API)
 module.exports = {
   apps: [
     {
-      name: 'pm2-manage-backend',
+      name: 'sys-pier-backend',
       script: 'server.cjs',
       cwd: __dirname,
       watch: false,

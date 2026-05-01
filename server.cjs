@@ -1,4 +1,5 @@
-// pm2-manage — browser dashboard + REST API for pm2 process management
+// sys-pier — browser dashboard + REST API for local dev resource management
+// (pm2 processes, daemons, cron, launchd, ports, nginx, claude instances)
 // Port: 5042 | Binds to 127.0.0.1 only (localhost-restricted)
 // No external dependencies — Node built-ins + pm2 CLI only
 //
@@ -23,6 +24,7 @@ const path = require('path');
 const { execSync, exec, spawn } = require('child_process');
 const os = require('os');
 const fs = require('fs');
+const portScanner = require('./port-scanner.cjs');
 
 // Guarantee full PATH for all shell commands — pm2 LaunchAgent runs with a stripped PATH
 // that may omit /opt/homebrew/bin (pm2, brew tools) and even /usr/bin (id, crontab).
@@ -40,8 +42,175 @@ if (!fs.existsSync(CLIENT_LOG_DIR)) fs.mkdirSync(CLIENT_LOG_DIR, { recursive: tr
 // Stores UI preferences: groups, colors, titles, ordering, merges, static URLs.
 // pm2 remains the source of truth for process state; this file is UI-only.
 
-const CONFIG_PATH = path.join(__dirname, 'pm2-manage-config.json');
-const DEFAULT_CONFIG = { version: 3, entries: {}, groups: {}, merges: {}, staticUrls: {}, globalOrder: [], scanResults: null, daemons: {}, cronOverrides: {}, launchdPinned: [], launchdOverrides: {} };
+const CONFIG_PATH = path.join(__dirname, 'sys-pier-config.json');
+const DEFAULT_CONFIG = { version: 5, entries: {}, groups: {}, merges: {}, staticUrls: {}, globalOrder: [], scanResults: null, daemons: {}, cronOverrides: {}, launchdPinned: [], launchdOverrides: {}, portScanner: { systemAllowlist: [], ignored: [] }, intensity: 'normal', tags: {} };
+
+// ── Stable-key convention for tags and other persistent metadata ──────────
+// Tags survive process restarts, reboots, and rediscovery because the key is
+// derived from the most stable identifier each item type has — never the pid.
+//   pm2:<name>           pm2 process name (stable across restarts)
+//   daemon:<key>         user-chosen daemon key (CONFIG.daemons[key])
+//   cron:<id>            hash(schedule + command) — same line, same id
+//   launchd:<label>      plist <Label> — stable per agent
+//   url:<slug>           static URL slug (CONFIG.staticUrls[slug])
+//   port:<command>:<cwd> orphan listener — most stable identity since pid + port may change
+function stableKey(type, key) {
+  return `${type}:${key}`;
+}
+
+// ── Claude instances reader ────────────────────────────────────────────────
+// Walks `pgrep -af claude`, filters to actual `claude` CLI processes (not
+// random matches like "claude-helper.app"), and enriches with cwd + start time.
+// Skips this server's own claude tools/agents the simplest way: any process
+// whose command line matches the `--print` flag (one-shot, will exit) is
+// flagged as transient.
+function scanClaudeInstances() {
+  let raw = '';
+  try {
+    // macOS pgrep doesn't have -a or -E. -l gives long output (pid + cmdline)
+    // when combined with -f (match against full command line).
+    raw = run('pgrep -lf "claude " 2>/dev/null', {
+      encoding: 'utf-8', timeout: 2000,
+    }).toString();
+  } catch (e) { raw = (e.stdout || '').toString(); }
+  const instances = [];
+  for (const line of raw.split('\n')) {
+    const m = line.match(/^\s*(\d+)\s+(.+)$/);
+    if (!m) continue;
+    const pid = parseInt(m[1], 10);
+    const cmd = m[2];
+    // Only the claude CLI binary, not Apple-Helper-style accidents.
+    if (!/(^|\/)claude(\s|$)/.test(cmd)) continue;
+    if (pid === process.pid) continue;
+    const modelMatch = cmd.match(/--model\s+(\S+)/);
+    const isOneShot = cmd.includes('--print') || cmd.includes(' -p ');
+    const cwd = portScanner.pidCwd ? portScanner.pidCwd(pid) : null;
+    let startedAt = null;
+    try {
+      const lstart = run(`ps -p ${pid} -o lstart= 2>/dev/null`, { encoding: 'utf-8', timeout: 1500 }).toString().trim();
+      if (lstart) startedAt = new Date(lstart).getTime() || null;
+    } catch {}
+    instances.push({
+      pid,
+      cwd,
+      model: modelMatch ? modelMatch[1] : null,
+      oneShot: isOneShot,
+      startedAt,
+      command: cmd.length > 200 ? cmd.slice(0, 200) + '…' : cmd,
+    });
+  }
+  return { instances, scannedAt: Date.now() };
+}
+
+// ── Nginx parser ──────────────────────────────────────────────────────────
+// Parses /opt/homebrew/etc/nginx/servers/*.conf into structured server blocks.
+// Lightweight regex-based scan — sufficient for surfacing dashboard info, not
+// a full nginx grammar. Cross-references upstream ports with port-scanner data
+// so the UI can show "alive" / "dead" against each proxy_pass.
+const NGINX_SERVERS_DIR = '/opt/homebrew/etc/nginx/servers';
+const NGINX_GEN_SCRIPT = path.join(os.homedir(), '.claude/scripts/dev-servers/gen-nginx-conf.sh');
+
+function _parseNginxConf(filePath) {
+  let content = '';
+  try { content = fs.readFileSync(filePath, 'utf-8'); } catch { return []; }
+  const blocks = [];
+  // Naive but works: split on top-level `server { ... }` boundaries by counting braces.
+  let depth = 0, start = -1;
+  const tokens = [];
+  let i = 0;
+  while (i < content.length) {
+    const c = content[i];
+    if (c === '#') { while (i < content.length && content[i] !== '\n') i++; continue; }
+    if (c === '{') {
+      if (depth === 0) {
+        // Look back ~80 chars for the keyword
+        const head = content.slice(Math.max(0, i - 80), i);
+        if (/\bserver\s*$/.test(head)) start = i + 1;
+      }
+      depth++;
+    } else if (c === '}') {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        tokens.push(content.slice(start, i));
+        start = -1;
+      }
+    }
+    i++;
+  }
+  for (const body of tokens) {
+    const block = { listens: [], serverNames: [], locations: [] };
+    for (const m of body.matchAll(/listen\s+([^;]+);/g)) block.listens.push(m[1].trim());
+    for (const m of body.matchAll(/server_name\s+([^;]+);/g))
+      block.serverNames.push(...m[1].trim().split(/\s+/));
+    for (const m of body.matchAll(/proxy_pass\s+([^;]+);/g))
+      block.locations.push({ proxyPass: m[1].trim() });
+    if (block.serverNames.length || block.locations.length) blocks.push(block);
+  }
+  return blocks;
+}
+
+function scanNginx() {
+  let files = [];
+  try { files = fs.readdirSync(NGINX_SERVERS_DIR).filter(f => f.endsWith('.conf')); } catch {}
+  const blocks = [];
+  for (const f of files) {
+    const blocksInFile = _parseNginxConf(path.join(NGINX_SERVERS_DIR, f));
+    for (const b of blocksInFile) blocks.push({ ...b, file: f });
+  }
+  // Service state via brew services (single call).
+  let brewServices = [];
+  try {
+    const raw = run('brew services list --json 2>/dev/null', { encoding: 'utf-8', timeout: 4000 }).toString();
+    const parsed = JSON.parse(raw);
+    brewServices = parsed.filter(s => /^(nginx|dnsmasq)$/.test(s.name));
+  } catch {}
+  // nginx -t result (cached short-window — running on every request would hammer).
+  let nginxTest = null;
+  try {
+    nginxTest = run('nginx -t 2>&1', { encoding: 'utf-8', timeout: 3000 }).toString().trim();
+  } catch (e) { nginxTest = (e.stdout || e.message || '').toString().trim(); }
+  // Cross-reference proxy_pass ports against current listener state.
+  const { listeners } = portScanner.lsofListeners();
+  const livePorts = new Set((listeners || []).map(l => l.port));
+  for (const b of blocks) {
+    for (const loc of b.locations) {
+      const m = loc.proxyPass.match(/:(\d+)\b/);
+      if (m) {
+        loc.upstreamPort = parseInt(m[1], 10);
+        loc.upstreamAlive = livePorts.has(loc.upstreamPort);
+      }
+    }
+  }
+  return {
+    serversDir: NGINX_SERVERS_DIR,
+    files,
+    blocks,
+    brewServices: brewServices.map(s => ({ name: s.name, status: s.status, user: s.user })),
+    nginxTest,
+    genScript: NGINX_GEN_SCRIPT,
+    genScriptExists: fs.existsSync(NGINX_GEN_SCRIPT),
+  };
+}
+
+// Walk upward from startDir looking for ecosystem.config.{cjs,js,mjs}. Used by
+// the adoption flow — running processes often have a cwd inside a subdir while
+// the ecosystem file lives at the project root. Capped at 5 levels to avoid
+// hitting / on a misconfigured cwd.
+function findEcosystemUp(startDir, maxDepth = 5) {
+  if (!startDir) return null;
+  const candidates = ['ecosystem.config.cjs', 'ecosystem.config.js', 'ecosystem.config.mjs'];
+  let dir = startDir;
+  for (let i = 0; i <= maxDepth; i++) {
+    for (const name of candidates) {
+      const p = path.join(dir, name);
+      try { if (fs.statSync(p).isFile()) return p; } catch {}
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
 
 // Generate a short UUID (8 chars) — sufficient for local config
 function genId() {
@@ -91,6 +260,25 @@ function migrateConfig(cfg) {
     if (!cfg.launchdPinned) cfg.launchdPinned = [];
     if (!cfg.launchdOverrides) cfg.launchdOverrides = {};
     cfg.version = 3;
+  }
+  // v3 → v4: sys-pier rebrand. Add portScanner and intensity scaffolding.
+  // systemAllowlist extends the built-in DEFAULT_SYSTEM_ALLOWLIST in port-scanner.cjs.
+  // ignored holds "command:port" keys the user has explicitly hidden from the orphan tray.
+  if (cfg.version < 4) {
+    if (!cfg.portScanner || typeof cfg.portScanner !== 'object') {
+      cfg.portScanner = { systemAllowlist: [], ignored: [] };
+    } else {
+      if (!Array.isArray(cfg.portScanner.systemAllowlist)) cfg.portScanner.systemAllowlist = [];
+      if (!Array.isArray(cfg.portScanner.ignored)) cfg.portScanner.ignored = [];
+    }
+    if (!cfg.intensity) cfg.intensity = 'normal'; // eco | normal | aggressive
+    cfg.version = 4;
+  }
+  // v4 → v5: cross-cutting tags. Keyed by stable identifiers (see stableKey)
+  // so tags survive rediscovery — pid changes don't lose them.
+  if (cfg.version < 5) {
+    if (!cfg.tags || typeof cfg.tags !== 'object') cfg.tags = {};
+    cfg.version = 5;
   }
   return cfg;
 }
@@ -309,6 +497,35 @@ function recordDaemonMetrics() {
 
 setInterval(() => { try { recordMetrics(pm2List()); recordDaemonMetrics(); } catch {} }, 5000);
 
+// ── Cache warmers ───────────────────────────────────────────────────────────
+// listLaunchAgents() is the worst offender on cold cache: 13 plist files × 2
+// subprocess calls each (plutil + launchctl print), sequentially → 1–2s.
+// 8s TTL means a 5s warmer keeps it continuously hot, so user-facing renders
+// always hit the warm path. Cost: ~5 subprocess calls/sec sustained, ~1% CPU.
+// pm2List + _readCrontabLines warmed once at boot; _readCrontabLines's TTL
+// is 3s and it's invoked from item-pipeline polls, so it self-warms.
+setImmediate(() => {
+  try { pm2List(); } catch {}
+  try { _readCrontabLines(); } catch {}
+  try { listLaunchAgents(); } catch {}
+});
+// Re-spawnable warmer. Self-reschedules each tick reading the current intensity,
+// so flipping the dropdown changes cadence on the next firing. setImmediate
+// defers the initial schedule to after module load completes — INTENSITY_PROFILES
+// is declared further down and would not yet be initialized at module-top time.
+let _launchdWarmerTimer = null;
+function _launchdWarmerTick() {
+  try { listLaunchAgents(); } catch {}
+  _launchdWarmerTimer = setTimeout(_launchdWarmerTick, currentIntensityProfile().launchd_warm);
+}
+function rescheduleLaunchdWarmer() {
+  if (_launchdWarmerTimer) clearTimeout(_launchdWarmerTimer);
+  _launchdWarmerTimer = setTimeout(_launchdWarmerTick, currentIntensityProfile().launchd_warm);
+}
+setImmediate(() => {
+  _launchdWarmerTimer = setTimeout(_launchdWarmerTick, currentIntensityProfile().launchd_warm);
+});
+
 // ── Static URL health history ─────────────────────────────────────────────
 // Rolling 20-sample window (~10 min at 30s intervals) of latency + status per URL.
 
@@ -356,12 +573,36 @@ function isLocalRequest(req) {
 
 // ── pm2 Helpers ────────────────────────────────────────────────────────────
 
+// ── Intensity profiles ──────────────────────────────────────────────────
+// Global dial: eco / normal / aggressive. Drives cache TTLs and warmer
+// cadences. Eco favors low CPU/battery (longer caches), aggressive favors
+// freshness (shorter). User can flip via the navbar dropdown.
+const INTENSITY_PROFILES = {
+  eco:        { pm2_ttl: 15000, launchd_warm: 15000, port_badge_poll: 60000 },
+  normal:     { pm2_ttl:  5000, launchd_warm:  5000, port_badge_poll: 30000 },
+  aggressive: { pm2_ttl:  1000, launchd_warm:  2000, port_badge_poll:  5000 },
+};
+function currentIntensityProfile() {
+  return INTENSITY_PROFILES[CONFIG.intensity] || INTENSITY_PROFILES.normal;
+}
+
+// pm2 jlist is a subprocess (~150–400ms on M-series). Without caching, a
+// single page render fires it ~3–5 times. TTL is intensity-driven.
+// Mutations call invalidatePm2Cache() so user actions reflect immediately.
+// Stale-on-error: prefer last known list so UI doesn't suddenly empty out.
+const _PM2_CACHE = { data: null, ts: 0 };
+function invalidatePm2Cache() { _PM2_CACHE.ts = 0; }
 function pm2List() {
+  const now = Date.now();
+  const ttl = currentIntensityProfile().pm2_ttl;
+  if (_PM2_CACHE.data && (now - _PM2_CACHE.ts) < ttl) return _PM2_CACHE.data;
   try {
     const raw = run('pm2 jlist', { encoding: 'utf-8', timeout: 8000 });
-    return JSON.parse(raw);
+    _PM2_CACHE.data = JSON.parse(raw);
+    _PM2_CACHE.ts = now;
+    return _PM2_CACHE.data;
   } catch {
-    return [];
+    return _PM2_CACHE.data || [];
   }
 }
 
@@ -669,10 +910,20 @@ function _cronId(schedule, command) {
   return (h >>> 0).toString(16).padStart(8, '0');
 }
 
+// crontab -l is a subprocess; parseCrontab() is invoked by both card render
+// paths and several /api endpoints, so it can fire 3+ times per request. 3s
+// TTL is plenty since edits to crontab are rare and dashboard isn't writing it.
+const _CRONTAB_CACHE = { lines: null, ts: 0 };
+const _CRONTAB_CACHE_TTL = 3000;
+function invalidateCrontabCache() { _CRONTAB_CACHE.ts = 0; }
 function _readCrontabLines() {
+  const now = Date.now();
+  if (_CRONTAB_CACHE.lines && (now - _CRONTAB_CACHE.ts) < _CRONTAB_CACHE_TTL) return _CRONTAB_CACHE.lines;
   try {
-    return run('crontab -l 2>/dev/null', { encoding: 'utf-8', timeout: 5000 }).split('\n');
-  } catch { return []; }
+    _CRONTAB_CACHE.lines = run('crontab -l 2>/dev/null', { encoding: 'utf-8', timeout: 5000 }).split('\n');
+    _CRONTAB_CACHE.ts = now;
+    return _CRONTAB_CACHE.lines;
+  } catch { return _CRONTAB_CACHE.lines || []; }
 }
 
 
@@ -1084,12 +1335,13 @@ function renderSingleCard(p) {
   const isCluster = (env.exec_mode || '').includes('cluster');
   const instances = env.instances || 1;
 
-  const primaryActions = isOnline
+  const detailBtn = `<button class="btn action-btn" onclick="openItemDetail('pm2','${escHtml(p.name)}')" title="View source + edit tags">ⓘ Info</button>`;
+  const primaryActions = detailBtn + ' ' + (isOnline
     ? `<button class="btn btn-warn action-btn" onclick="doAction('restart','${escHtml(p.name)}',this)" title="Restart: stop + start. Picks up code changes.">↺ Restart</button>
        <button class="btn action-btn" onclick="doAction('reload','${escHtml(p.name)}',this)" title="Reload: graceful restart — 0-downtime for cluster mode; same as restart for fork mode">⟳ Reload</button>
        <button class="btn btn-danger action-btn" onclick="doAction('stop','${escHtml(p.name)}',this)" title="Stop: halt the process but keep it in pm2's list">■ Stop</button>`
     : `<button class="btn btn-ok action-btn" onclick="doAction('start','${escHtml(p.name)}',this)" title="Start: resume this stopped process">▶ Start</button>
-       <button class="btn btn-danger action-btn" onclick="confirmDelete('${escHtml(p.name)}')" title="Delete: remove from pm2 entirely (not reversible without re-running the ecosystem file)">✕ Delete</button>`;
+       <button class="btn btn-danger action-btn" onclick="confirmDelete('${escHtml(p.name)}')" title="Delete: remove from pm2 entirely (not reversible without re-running the ecosystem file)">✕ Delete</button>`);
 
   const advActions = isOnline ? `
   <div class="card-actions-adv" data-name="${escHtml(p.name)}">
@@ -1202,11 +1454,12 @@ function renderDaemonCard(key, summary) {
     ? `<span class="color-dot" style="background:${entryCfg.color}" onclick="event.stopPropagation();toggleColorPicker('daemon:${escHtml(key)}',this)" title="Click to change color"></span>`
     : `<span class="color-dot color-dot-empty" onclick="event.stopPropagation();toggleColorPicker('daemon:${escHtml(key)}',this)" title="Click to set color"></span>`;
 
-  const primaryActions = isOnline
+  const daemonDetailBtn = `<button class="btn action-btn" onclick="openItemDetail('daemon','${escHtml(key)}')" title="View command, workdir, env + edit tags">ⓘ Info</button>`;
+  const primaryActions = daemonDetailBtn + ' ' + (isOnline
     ? `<button class="btn btn-warn action-btn" onclick="doDaemonAction('restart','${escHtml(key)}',this)" title="Restart daemon">↺ Restart</button>
        <button class="btn btn-danger action-btn" onclick="doDaemonAction('stop','${escHtml(key)}',this)" title="Stop daemon">■ Stop</button>`
     : `<button class="btn btn-ok action-btn" onclick="doDaemonAction('start','${escHtml(key)}',this)" title="Start daemon">▶ Start</button>
-       <button class="btn btn-danger action-btn" onclick="confirmDeleteDaemon('${escHtml(key)}')" title="Remove daemon from registry">✕ Remove</button>`;
+       <button class="btn btn-danger action-btn" onclick="confirmDeleteDaemon('${escHtml(key)}')" title="Remove daemon from registry">✕ Remove</button>`);
 
   const cmdShort = summary.command.length > 50 ? summary.command.slice(0, 50) + '…' : summary.command;
   const cwdShort = (summary.workdir || '').replace(os.homedir(), '~');
@@ -1219,7 +1472,7 @@ function renderDaemonCard(key, summary) {
       ${colorDot}
       <span class="proc-icon" title="Custom daemon">${escHtml(icon)}</span>
       <span class="proc-name" ondblclick="startTitleEdit('daemon:${escHtml(key)}',this)">${escHtml(displayTitle)}</span>
-      <span class="type-badge type-badge--daemon" title="Custom daemon managed by pm2-manage">daemon</span>
+      <span class="type-badge type-badge--daemon" title="Custom daemon managed by sys-pier">daemon</span>
     </div>
     <span class="badge ${status}" title="${escHtml(statusTip)}">${status}</span>
   </div>
@@ -1270,10 +1523,11 @@ function renderCronCard(entry) {
     ? `<span class="color-dot" style="background:${entryCfg.color}" onclick="event.stopPropagation();toggleColorPicker('cron:${escHtml(id)}',this)" title="Click to change color"></span>`
     : `<span class="color-dot color-dot-empty" onclick="event.stopPropagation();toggleColorPicker('cron:${escHtml(id)}',this)" title="Click to set color"></span>`;
 
-  const primaryActions = enabled
+  const cronDetailBtn = `<button class="btn action-btn" onclick="openItemDetail('cron','${escHtml(id)}')" title="View raw crontab line, schedule, next run + edit tags">ⓘ Info</button>`;
+  const primaryActions = cronDetailBtn + ' ' + (enabled
     ? `<button class="btn btn-ok action-btn" onclick="doCronAction('run-now','${escHtml(id)}',this)" title="Run this command immediately">▶ Run Now</button>
        <button class="btn btn-warn action-btn" onclick="doCronAction('disable','${escHtml(id)}',this)" title="Comment out this cron entry">⏸ Disable</button>`
-    : `<button class="btn btn-ok action-btn" onclick="doCronAction('enable','${escHtml(id)}',this)" title="Uncomment this cron entry">▶ Enable</button>`;
+    : `<button class="btn btn-ok action-btn" onclick="doCronAction('enable','${escHtml(id)}',this)" title="Uncomment this cron entry">▶ Enable</button>`);
 
   return `<div class="card card-enter" data-status="${status}" data-name="${escHtml(`cron:${id}`)}" data-type="cron" style="${colorStyle}">
   <div class="card-header">
@@ -1326,14 +1580,15 @@ function renderLaunchdCard(agent) {
     ? `<span class="color-dot" style="background:${entryCfg.color}" onclick="event.stopPropagation();toggleColorPicker('launchd:${escHtml(label)}',this)" title="Click to change color"></span>`
     : `<span class="color-dot color-dot-empty" onclick="event.stopPropagation();toggleColorPicker('launchd:${escHtml(label)}',this)" title="Click to set color"></span>`;
 
-  const primaryActions = loaded
+  const launchdDetailBtn = `<button class="btn action-btn" onclick="openItemDetail('launchd','${escHtml(label)}')" title="View plist source, schedule, paths + edit tags">ⓘ Info</button>`;
+  const primaryActions = launchdDetailBtn + ' ' + (loaded
     ? isOnline
       ? `<button class="btn btn-warn action-btn" onclick="doLaunchdAction('kickstart','${escHtml(label)}',this)" title="Force-restart (kickstart -k)">↺ Restart</button>
          <button class="btn btn-danger action-btn" onclick="doLaunchdAction('stop','${escHtml(label)}',this)" title="Stop the service (launchctl stop)">■ Stop</button>
          <button class="btn action-btn" onclick="doLaunchdAction('unload','${escHtml(label)}',this)" title="Unload the LaunchAgent (launchctl unload)">⏏ Unload</button>`
       : `<button class="btn btn-ok action-btn" onclick="doLaunchdAction('kickstart','${escHtml(label)}',this)" title="Kickstart the service">▶ Start</button>
          <button class="btn action-btn" onclick="doLaunchdAction('unload','${escHtml(label)}',this)" title="Unload the LaunchAgent">⏏ Unload</button>`
-    : `<button class="btn btn-ok action-btn" onclick="doLaunchdAction('load','${escHtml(label)}',this)" title="Load the LaunchAgent (launchctl load)">⬆ Load</button>`;
+    : `<button class="btn btn-ok action-btn" onclick="doLaunchdAction('load','${escHtml(label)}',this)" title="Load the LaunchAgent (launchctl load)">⬆ Load</button>`);
 
   const keepAliveTag = keepAlive ? `<span style="color:var(--warning);font-size:0.6rem;margin-left:4px" title="KeepAlive — launchd will restart if it exits">♻</span>` : '';
   const scheduleStr = schedule || (runAtLoad ? 'On load' : '—');
@@ -1726,6 +1981,7 @@ const ITEM_ADAPTERS = {
       if (!ALLOWED.includes(cmd) || !validateName(name)) return { ok: false, error: 'invalid command or name' };
       try {
         run(`pm2 ${cmd} ${JSON.stringify(name)}`, { timeout: 15000 });
+        invalidatePm2Cache();
         return { ok: true };
       } catch (e) { return { ok: false, error: e.message }; }
     },
@@ -1793,6 +2049,7 @@ const ITEM_ADAPTERS = {
         if (cmd === 'restart') { for (const n of pNames) run(`pm2 restart ${JSON.stringify(n)}`, { timeout: 15000 }); }
         else if (cmd === 'start') { for (const n of pNames) run(`pm2 start ${JSON.stringify(n)}`, { timeout: 15000 }); }
         else return { ok: false, error: `Unknown cmd: ${cmd}` };
+        invalidatePm2Cache();
         return { ok: true };
       } catch (e) { return { ok: false, error: e.message }; }
     },
@@ -2138,7 +2395,7 @@ function renderPage(processes) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>pm2 Manager</title>
+  <title>sys-pier</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%230d1117'/><text x='50%' y='54%' font-size='18' font-family='monospace' font-weight='700' fill='%2358a6ff' text-anchor='middle' dominant-baseline='middle'>p2</text></svg>">
   <style>
     /* ── Design tokens (default: GitHub Dark) ───────────────────────────── */
@@ -2547,12 +2804,13 @@ function renderPage(processes) {
       grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
       gap: 0.875rem;
     }
-    /* In grouped mode the outer #grid hosts .group-section blocks that must
-       each span full width — switch to block layout so they stack vertically */
+    /* In grouped mode the outer #grid lays group columns side-by-side */
     #grid:has(.group-section) {
       display: flex;
-      flex-direction: column;
-      gap: 0;
+      flex-direction: row;
+      flex-wrap: wrap;
+      align-items: flex-start;
+      gap: 1rem;
     }
 
     /* ── Skeleton loading ───────────────────────────────────────────────── */
@@ -3563,7 +3821,9 @@ function renderPage(processes) {
 
     /* ── Group sections ────────────────────────────────────────────────── */
     .group-section {
-      margin-bottom: 1.25rem;
+      flex: 1;
+      min-width: 320px;
+      margin-bottom: 0;
       border: 1px solid var(--border-subtle);
       background: var(--bg-secondary);
       border-radius: var(--radius);
@@ -3571,13 +3831,13 @@ function renderPage(processes) {
       transition: opacity 0.2s, border-color 0.2s, box-shadow 0.2s;
     }
     .group-section.drag-source { opacity: 0.35; }
-    .group-section.drag-over-top {
-      border-top: 2px solid var(--accent);
-      box-shadow: 0 -2px 8px rgba(99,102,241,0.25);
+    .group-section.drag-over-left {
+      border-left: 2px solid var(--accent);
+      box-shadow: -2px 0 8px rgba(99,102,241,0.25);
     }
-    .group-section.drag-over-bottom {
-      border-bottom: 2px solid var(--accent);
-      box-shadow: 0 2px 8px rgba(99,102,241,0.25);
+    .group-section.drag-over-right {
+      border-right: 2px solid var(--accent);
+      box-shadow: 2px 0 8px rgba(99,102,241,0.25);
     }
     /* Cross-group card drag feedback */
     .group-section.card-drag-source {
@@ -3841,7 +4101,7 @@ function renderPage(processes) {
 <body>
   <header>
     <div class="header-left">
-      <div class="logo"><strong>pm2</strong> manage</div>
+      <div class="logo"><strong>sys</strong>-pier</div>
       <span class="proc-count" id="proc-count">${count} process${count !== 1 ? 'es' : ''}</span>
     </div>
     <div class="search-wrap">
@@ -4066,7 +4326,7 @@ function renderPage(processes) {
   <div class="backdrop" id="help-modal">
     <div class="modal" style="max-width:640px">
       <div class="modal-header">
-        <span class="modal-title"><strong>pm2 Manager</strong> — Quick Reference</span>
+        <span class="modal-title"><strong>sys-pier</strong> — Quick Reference</span>
         <button class="modal-close" onclick="closeModal('help-modal')">✕</button>
       </div>
       <div class="help-body">
@@ -4170,6 +4430,46 @@ function renderPage(processes) {
         <button class="modal-close" onclick="closeModal('scan-modal')">✕</button>
       </div>
       <div id="scan-content"></div>
+    </div>
+  </div>
+
+  <div class="backdrop" id="ports-modal">
+    <div class="modal modal-wide">
+      <div class="modal-header">
+        <h2>🔌 Discovered Ports</h2>
+        <button class="modal-close" onclick="closeModal('ports-modal')">✕</button>
+      </div>
+      <div id="ports-content" style="padding:1rem 1.5rem 1.5rem;font-size:0.85rem"></div>
+    </div>
+  </div>
+
+  <div class="backdrop" id="detail-modal">
+    <div class="modal modal-wide">
+      <div class="modal-header">
+        <h2 id="detail-title">Item Detail</h2>
+        <button class="modal-close" onclick="closeModal('detail-modal')">✕</button>
+      </div>
+      <div id="detail-content" style="padding:1rem 1.5rem 1.5rem;font-size:0.85rem"></div>
+    </div>
+  </div>
+
+  <div class="backdrop" id="nginx-modal">
+    <div class="modal modal-wide">
+      <div class="modal-header">
+        <h2>🌐 Nginx</h2>
+        <button class="modal-close" onclick="closeModal('nginx-modal')">✕</button>
+      </div>
+      <div id="nginx-content" style="padding:1rem 1.5rem 1.5rem;font-size:0.85rem"></div>
+    </div>
+  </div>
+
+  <div class="backdrop" id="claude-modal">
+    <div class="modal modal-wide">
+      <div class="modal-header">
+        <h2>✦ Claude Instances</h2>
+        <button class="modal-close" onclick="closeModal('claude-modal')">✕</button>
+      </div>
+      <div id="claude-content" style="padding:1rem 1.5rem 1.5rem;font-size:0.85rem"></div>
     </div>
   </div>
 
@@ -5973,11 +6273,31 @@ function renderPage(processes) {
           key: 'd', noMod: true, hint: 'discover',
           title: 'Scan for new projects (d)',
           group: 'actions', action: () => openScanModal() },
+        { id: 'ports-btn', label: 'Ports',
+          icon: '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" style="vertical-align:-2px"><path d="M2 5h12M2 8h12M2 11h12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="5" cy="5" r="1" fill="currentColor"/><circle cx="9" cy="8" r="1" fill="currentColor"/><circle cx="11" cy="11" r="1" fill="currentColor"/></svg>',
+          key: 'p', noMod: true, hint: 'ports',
+          title: 'Discovered ports — orphan listeners outside pm2 (p)',
+          group: 'actions', action: () => openPortsModal() },
         { id: 'daemon-btn', label: 'Daemon',
           icon: '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" style="vertical-align:-2px"><path d="M8 1L3 4v4c0 3.3 2.2 6.1 5 7 2.8-.9 5-3.7 5-7V4L8 1z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M6 8l1.5 1.5L10 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
           key: 'n', noMod: true, hint: 'new daemon',
           title: 'Register a new custom daemon (n)',
           group: 'actions', action: () => openCreateDaemonModal() },
+        { id: 'nginx-btn', label: 'Nginx',
+          icon: '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" style="vertical-align:-2px"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.4"/><path d="M5 11V5l6 6V5" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" fill="none"/></svg>',
+          key: 'g', noMod: true, hint: 'nginx',
+          title: 'Nginx server blocks + .test domains (g)',
+          group: 'actions', action: () => openNginxModal() },
+        { id: 'claude-btn', label: 'Claude',
+          icon: '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" style="vertical-align:-2px"><path d="M8 1l1.8 4.4L14 7l-3.5 2.6L11.5 14 8 11.5 4.5 14l1-4.4L2 7l4.2-1.6L8 1z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>',
+          key: 'i', noMod: true, hint: 'claude',
+          title: 'Live Claude CLI instances (i)',
+          group: 'actions', action: () => openClaudeModal() },
+        { type: 'nav-sep' },
+        // Intensity dial — sets pm2 cache TTL + warmer cadence + UI poll rate.
+        // Eco saves CPU/battery; Aggressive optimizes for freshness.
+        { type: 'separator',
+          html: '<select id="intensity-select" onchange="setIntensity(this.value)" title="Polling intensity: eco=low CPU, aggressive=fresh data" style="background:var(--bg-tertiary,#1a1a1a);border:1px solid var(--border);color:var(--text);border-radius:3px;padding:2px 6px;font-size:0.72rem;cursor:pointer"><option value="eco">⚡ eco</option><option value="normal" selected>⚡ normal</option><option value="aggressive">⚡ aggressive</option></select>' },
         { type: 'nav-sep' },
         // ── Settings ──
         { id: 'config-btn', label: '',
@@ -6257,8 +6577,8 @@ function renderPage(processes) {
     }
 
     function clearDragIndicators() {
-      document.querySelectorAll('.drag-over-top,.drag-over-bottom').forEach((el) => {
-        el.classList.remove('drag-over-top', 'drag-over-bottom');
+      document.querySelectorAll('.drag-over-top,.drag-over-bottom,.drag-over-left,.drag-over-right').forEach((el) => {
+        el.classList.remove('drag-over-top', 'drag-over-bottom', 'drag-over-left', 'drag-over-right');
       });
       document.querySelectorAll('.group-section.card-drag-target').forEach((el) => {
         el.classList.remove('card-drag-target');
@@ -6351,8 +6671,8 @@ function renderPage(processes) {
     function _clearGroupDragState() {
       _dragGroupId = null;
       if (_groupPlaceholder) { _groupPlaceholder.remove(); _groupPlaceholder = null; }
-      document.querySelectorAll('.group-section.drag-over-top,.group-section.drag-over-bottom,.group-section.drag-source').forEach(function(el) {
-        el.classList.remove('drag-over-top', 'drag-over-bottom', 'drag-source');
+      document.querySelectorAll('.group-section.drag-over-left,.group-section.drag-over-right,.group-section.drag-source').forEach(function(el) {
+        el.classList.remove('drag-over-left', 'drag-over-right', 'drag-source');
       });
     }
 
@@ -6381,15 +6701,15 @@ function renderPage(processes) {
         if (!section || section.dataset.group === _dragGroupId || section.dataset.placeholder) return;
         e.preventDefault();
         e.dataTransfer.dropEffect = 'move';
-        document.querySelectorAll('.group-section.drag-over-top,.group-section.drag-over-bottom').forEach(function(el) {
-          el.classList.remove('drag-over-top', 'drag-over-bottom');
+        document.querySelectorAll('.group-section.drag-over-left,.group-section.drag-over-right').forEach(function(el) {
+          el.classList.remove('drag-over-left', 'drag-over-right');
         });
         var rect = section.getBoundingClientRect();
-        var pos = (e.clientY - rect.top) < rect.height / 2 ? 'top' : 'bottom';
-        section.classList.add(pos === 'top' ? 'drag-over-top' : 'drag-over-bottom');
+        var pos = (e.clientX - rect.left) < rect.width / 2 ? 'left' : 'right';
+        section.classList.add(pos === 'left' ? 'drag-over-left' : 'drag-over-right');
         // Move placeholder to show where section will land
         if (_groupPlaceholder) {
-          if (pos === 'top') section.parentElement.insertBefore(_groupPlaceholder, section);
+          if (pos === 'left') section.parentElement.insertBefore(_groupPlaceholder, section);
           else section.parentElement.insertBefore(_groupPlaceholder, section.nextSibling);
         }
       });
@@ -6399,13 +6719,13 @@ function renderPage(processes) {
         if (!targetSection || targetSection.dataset.group === _dragGroupId || targetSection.dataset.placeholder) return;
         e.preventDefault();
         var rect = targetSection.getBoundingClientRect();
-        var pos = (e.clientY - rect.top) < rect.height / 2 ? 'top' : 'bottom';
+        var pos = (e.clientX - rect.left) < rect.width / 2 ? 'left' : 'right';
         var sourceSection = grid.querySelector('.group-section[data-group="' + CSS.escape(_dragGroupId) + '"]');
         _clearGroupDragState();
         if (sourceSection) {
           // Animated reorder via View Transitions API if supported
           var doReorder = function() {
-            if (pos === 'top') targetSection.parentElement.insertBefore(sourceSection, targetSection);
+            if (pos === 'left') targetSection.parentElement.insertBefore(sourceSection, targetSection);
             else targetSection.parentElement.insertBefore(sourceSection, targetSection.nextSibling);
           };
           if (document.startViewTransition) {
@@ -6550,7 +6870,7 @@ function renderPage(processes) {
       var blob = new Blob([JSON.stringify(DASH_CONFIG, null, 2)], { type: 'application/json' });
       var a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = 'pm2-manage-config.json';
+      a.download = 'sys-pier-config.json';
       a.click();
       URL.revokeObjectURL(a.href);
       toast('Config exported', 'ok');
@@ -7189,6 +7509,566 @@ function renderPage(processes) {
 
     // Init scan badge on load
     updateScanBadge();
+
+    // ── Discovered Ports (orphan listener tray) ────────────────────────
+    let _portsRefreshTimer = null;
+    let _portsLastSummary = null;
+
+    async function fetchPorts(enrich) {
+      const url = '/api/ports/discover' + (enrich ? '' : '?enrich=0');
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    }
+
+    async function updatePortsBadge() {
+      try {
+        const data = await fetchPorts(false);
+        _portsLastSummary = data.summary;
+        const btn = document.getElementById('ports-btn');
+        if (!btn) return;
+        let badge = btn.querySelector('.scan-badge');
+        const orphan = data.summary.orphan || 0;
+        if (orphan > 0) {
+          if (badge) badge.textContent = orphan;
+          else btn.insertAdjacentHTML('beforeend', '<span class="scan-badge" style="background:var(--yellow,#d97706);color:#000">' + orphan + '</span>');
+        } else if (badge) {
+          badge.remove();
+        }
+      } catch {}
+    }
+
+    function _esc2(s) {
+      return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+    function _truncate(s, n) {
+      s = String(s == null ? '' : s);
+      return s.length > n ? s.slice(0, n) + '…' : s;
+    }
+
+    async function openPortsModal() {
+      document.getElementById('ports-modal').classList.add('open');
+      document.getElementById('ports-content').innerHTML = '<p style="color:var(--text-muted)">Scanning…</p>';
+      await refreshPortsModal();
+      // auto-refresh every 5s while modal is open
+      if (_portsRefreshTimer) clearInterval(_portsRefreshTimer);
+      _portsRefreshTimer = setInterval(refreshPortsModal, 5000);
+    }
+
+    // Stop the auto-refresh when the modal closes (closeModal is the existing helper)
+    const _origCloseModal = window.closeModal;
+    window.closeModal = function(id) {
+      if (id === 'ports-modal' && _portsRefreshTimer) {
+        clearInterval(_portsRefreshTimer);
+        _portsRefreshTimer = null;
+      }
+      return _origCloseModal.apply(this, arguments);
+    };
+
+    async function refreshPortsModal() {
+      let data;
+      try { data = await fetchPorts(true); }
+      catch (err) {
+        document.getElementById('ports-content').innerHTML = '<p style="color:var(--red)">Scan failed: ' + _esc2(err.message) + '</p>';
+        return;
+      }
+      _portsLastSummary = data.summary;
+      const orphans = data.listeners.filter(l => l.classification.kind === 'orphan');
+      const pm2 = data.listeners.filter(l => l.classification.kind === 'pm2');
+      const sys = data.listeners.filter(l => l.classification.kind === 'system');
+      const ignored = data.listeners.filter(l => l.classification.kind === 'ignored');
+
+      let html = '';
+      // Summary strip + adopt-queue action
+      html += '<div style="display:flex;gap:1rem;margin-bottom:1rem;font-size:0.78rem;color:var(--text-muted);align-items:center">';
+      html += '<span><strong style="color:var(--green)">' + pm2.length + '</strong> pm2</span>';
+      html += '<span><strong style="color:var(--yellow,#d97706)">' + orphans.length + '</strong> orphan</span>';
+      html += '<span><strong>' + sys.length + '</strong> system</span>';
+      html += '<span><strong>' + ignored.length + '</strong> ignored</span>';
+      html += '<span style="margin-left:auto">scanned ' + new Date(data.scannedAt).toLocaleTimeString() + '</span>';
+      html += '</div>';
+
+      // Pending adopt queue surfacer
+      const queue = (data.adoptQueue || []);
+      if (queue.length) {
+        html += '<div style="background:color-mix(in srgb, var(--yellow,#d97706) 15%, transparent);border:1px solid color-mix(in srgb, var(--yellow,#d97706) 35%, transparent);padding:0.6rem 0.8rem;border-radius:4px;margin-bottom:1rem;display:flex;align-items:center;gap:0.6rem;font-size:0.78rem">';
+        html += '<strong>' + queue.length + ' adoption' + (queue.length === 1 ? '' : 's') + ' queued</strong>';
+        html += '<span style="color:var(--text-muted);flex:1">' + queue.map(q => q.suggestedName || (q.command + ':' + q.port)).join(', ') + '</span>';
+        html += '<button class="btn action-btn" onclick="previewAdoptQueue()" title="Show what will be adopted, no changes">Preview</button>';
+        html += '<button class="btn btn-warn action-btn" onclick="processAdoptQueue()" title="Stop bare procs, pm2 start ecosystem entries, pm2 save">Process</button>';
+        html += '</div>';
+      }
+
+      // Orphan section — the focus
+      if (orphans.length === 0) {
+        html += '<div style="padding:2rem;text-align:center;color:var(--green);background:var(--bg-tertiary,#1a1a1a);border-radius:6px;margin-bottom:1rem">';
+        html += '✓ no unmanaged listeners — your dev environment is clean</div>';
+      } else {
+        html += '<h3 style="font-size:0.9rem;margin:0 0 0.5rem">Orphan listeners (' + orphans.length + ')</h3>';
+        html += '<table style="width:100%;border-collapse:collapse;font-size:0.78rem">';
+        html += '<thead><tr style="text-align:left;color:var(--text-muted);border-bottom:1px solid var(--border)">';
+        html += '<th style="padding:0.4rem 0.3rem">port</th><th>command</th><th>pid</th><th>cwd</th><th style="text-align:right">actions</th>';
+        html += '</tr></thead><tbody>';
+        for (const o of orphans) {
+          const cmdLine = o.commandLine ? _truncate(o.commandLine, 80) : '';
+          html += '<tr style="border-bottom:1px solid var(--border)" title="' + _esc2(o.commandLine || '') + '">';
+          html += '<td style="padding:0.4rem 0.3rem;font-family:monospace"><strong>' + o.port + '</strong></td>';
+          html += '<td style="font-family:monospace">' + _esc2(o.command) + '</td>';
+          html += '<td style="font-family:monospace;color:var(--text-muted)">' + o.pid + '</td>';
+          html += '<td style="font-family:monospace;color:var(--text-muted)">' + _esc2(_truncate(o.cwd || '', 40)) + '</td>';
+          html += '<td style="text-align:right;white-space:nowrap">';
+          html += '<button class="btn-tiny" onclick="adoptOrphan(' + o.port + ',' + o.pid + ',' + JSON.stringify(o.command).replace(/"/g, '&quot;') + ',' + JSON.stringify(o.cwd || '').replace(/"/g, '&quot;') + ')" title="Queue for pm2 adoption">adopt</button> ';
+          html += '<button class="btn-tiny" onclick="allowlistCommand(' + JSON.stringify(o.command).replace(/"/g, '&quot;') + ')" title="Allowlist this command name (silences all its current and future ports)">allow</button> ';
+          html += '<button class="btn-tiny" onclick="ignorePort(' + JSON.stringify(o.command).replace(/"/g, '&quot;') + ',' + o.port + ')" title="Ignore just this command:port pair">ignore</button> ';
+          html += '<button class="btn-tiny btn-danger" onclick="killOrphan(' + o.pid + ',' + JSON.stringify(o.command).replace(/"/g, '&quot;') + ',' + o.port + ')" title="Send SIGTERM">kill</button>';
+          html += '</td></tr>';
+        }
+        html += '</tbody></table>';
+      }
+
+      // Collapsible details for system + pm2
+      html += '<details style="margin-top:1rem"><summary style="cursor:pointer;color:var(--text-muted);font-size:0.78rem">show ' + (pm2.length + sys.length + ignored.length) + ' managed listeners</summary>';
+      html += '<table style="width:100%;border-collapse:collapse;font-size:0.75rem;margin-top:0.5rem">';
+      html += '<tbody>';
+      for (const l of [...pm2, ...sys, ...ignored]) {
+        html += '<tr style="border-bottom:1px solid var(--border);color:var(--text-muted)">';
+        html += '<td style="padding:0.25rem 0.3rem;font-family:monospace">' + l.port + '</td>';
+        html += '<td style="font-family:monospace">' + _esc2(l.command) + '</td>';
+        html += '<td><span class="type-badge type-badge--' + l.classification.kind + '" style="opacity:0.7">' + l.classification.kind + '</span> ' + _esc2(l.classification.label || '') + '</td>';
+        html += '</tr>';
+      }
+      html += '</tbody></table></details>';
+
+      document.getElementById('ports-content').innerHTML = html;
+    }
+
+    async function adoptOrphan(port, pid, command, cwd) {
+      try {
+        const res = await fetch('/api/ports/adopt', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ port, pid, command, cwd }),
+        });
+        const data = await res.json();
+        if (data.ok) toast('Queued for adoption (M2 endpoint not yet wired — ' + data.queueSize + ' in queue)', 'ok');
+        else toast('Adopt failed: ' + (data.error || 'unknown'), 'err');
+      } catch (err) { toast('Adopt failed: ' + err.message, 'err'); }
+      refreshPortsModal();
+      updatePortsBadge();
+    }
+
+    async function allowlistCommand(command) {
+      try {
+        const res = await fetch('/api/ports/allowlist', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command }),
+        });
+        const data = await res.json();
+        if (data.ok) toast('Allowlisted: ' + command, 'ok');
+        else toast('Allowlist failed: ' + (data.error || 'unknown'), 'err');
+      } catch (err) { toast('Allowlist failed: ' + err.message, 'err'); }
+      refreshPortsModal();
+      updatePortsBadge();
+    }
+
+    async function ignorePort(command, port) {
+      try {
+        const res = await fetch('/api/ports/ignore', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command, port }),
+        });
+        const data = await res.json();
+        if (data.ok) toast('Ignored ' + command + ':' + port, 'ok');
+        else toast('Ignore failed: ' + (data.error || 'unknown'), 'err');
+      } catch (err) { toast('Ignore failed: ' + err.message, 'err'); }
+      refreshPortsModal();
+      updatePortsBadge();
+    }
+
+    async function killOrphan(pid, command, port) {
+      if (!confirm('Send SIGTERM to ' + command + ' (pid ' + pid + ', port ' + port + ')?')) return;
+      try {
+        const res = await fetch('/api/ports/kill', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pid, signal: 'TERM' }),
+        });
+        const data = await res.json();
+        if (data.ok) toast('Sent SIGTERM to pid ' + pid, 'ok');
+        else toast('Kill failed: ' + (data.error || 'unknown'), 'err');
+      } catch (err) { toast('Kill failed: ' + err.message, 'err'); }
+      setTimeout(() => { refreshPortsModal(); updatePortsBadge(); }, 800);
+    }
+
+    async function previewAdoptQueue() {
+      try {
+        const res = await fetch('/api/ports/adopt-queue/process', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ preview: true }),
+        });
+        const data = await res.json();
+        const lines = data.results.map(r =>
+          (r.ok ? '✓' : '✗') + ' ' + (r.suggestedName || ('port ' + r.port)) +
+          ' → ' + (r.ecosystem || r.error || 'no ecosystem found')
+        );
+        alert('Adoption preview (' + data.processed + ' entries):\\n\\n' + lines.join('\\n') +
+          '\\n\\nClick Process to actually run.');
+      } catch (err) { toast('Preview failed: ' + err.message, 'err'); }
+    }
+
+    async function processAdoptQueue() {
+      if (!confirm('Process adoption queue?\\n\\nThis will:\\n  1. SIGTERM each bare process (SIGKILL after 2s if still alive)\\n  2. pm2 start <ecosystem> --only <name>\\n  3. pm2 save\\n\\nProceed?')) return;
+      const btn = event && event.target;
+      if (btn) { btn.disabled = true; btn.textContent = 'Processing…'; }
+      try {
+        const res = await fetch('/api/ports/adopt-queue/process', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        const data = await res.json();
+        const ok = data.results.filter(r => r.ok).length;
+        const fail = data.results.length - ok;
+        if (ok) toast(ok + ' adopted, ' + fail + ' failed (queue: ' + data.remainingQueue + ')', fail ? 'warn' : 'ok');
+        if (fail) {
+          const failures = data.results.filter(r => !r.ok)
+            .map(r => (r.suggestedName || ('port ' + r.port)) + ': ' + (r.error || r.steps.filter(s => !s.ok).map(s => s.step + '/' + s.detail).join('; ')))
+            .join('\\n');
+          alert('Failures:\\n\\n' + failures);
+        }
+      } catch (err) { toast('Process failed: ' + err.message, 'err'); }
+      setTimeout(() => { refreshPortsModal(); updatePortsBadge(); refresh && refresh(); }, 1500);
+    }
+
+    // Auto-update orphan badge in background. Cadence comes from the server
+    // intensity profile (5s aggressive, 30s normal, 60s eco) so flipping the
+    // dial changes UI poll load too. Re-fetched on intensity change.
+    let _portsBadgeTimer = null;
+    let _portBadgeIntervalMs = 30000;
+    async function rescheduleBadge() {
+      try {
+        const data = await fetch('/api/intensity').then(r => r.json());
+        _portBadgeIntervalMs = data.profile.port_badge_poll || 30000;
+      } catch {}
+      if (_portsBadgeTimer) clearInterval(_portsBadgeTimer);
+      _portsBadgeTimer = setInterval(updatePortsBadge, _portBadgeIntervalMs);
+    }
+    updatePortsBadge();
+    rescheduleBadge();
+
+    // ── Intensity dropdown (eco/normal/aggressive) ───────────────────────
+    async function setIntensity(v) {
+      try {
+        const res = await fetch('/api/intensity', {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ intensity: v }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          toast('Intensity → ' + v + ' (pm2 ttl ' + (data.profile.pm2_ttl/1000) + 's)', 'ok');
+          rescheduleBadge();
+        } else toast('Failed: ' + (data.error || 'unknown'), 'err');
+      } catch (err) { toast('Failed: ' + err.message, 'err'); }
+    }
+    async function initIntensityDropdown() {
+      try {
+        const data = await fetch('/api/intensity').then(r => r.json());
+        const sel = document.getElementById('intensity-select');
+        if (sel) sel.value = data.intensity;
+      } catch {}
+    }
+    initIntensityDropdown();
+
+    // ── Nginx modal ──────────────────────────────────────────────────────
+    async function openNginxModal() {
+      document.getElementById('nginx-modal').classList.add('open');
+      document.getElementById('nginx-content').innerHTML = '<p style="color:var(--text-muted)">Loading…</p>';
+      try {
+        const data = await fetch('/api/nginx').then(r => r.json());
+        renderNginxModal(data);
+      } catch (err) {
+        document.getElementById('nginx-content').innerHTML = '<p style="color:var(--red)">Failed: ' + _esc2(err.message) + '</p>';
+      }
+    }
+
+    function renderNginxModal(d) {
+      let html = '';
+      // Service state strip
+      html += '<div style="display:flex;gap:1rem;margin-bottom:1rem;font-size:0.78rem;color:var(--text-muted);align-items:center;flex-wrap:wrap">';
+      for (const s of d.brewServices || []) {
+        const dot = s.status === 'started' ? '🟢' : s.status === 'error' ? '🔴' : '⚪';
+        html += '<span>' + dot + ' <strong>' + _esc2(s.name) + '</strong> ' + _esc2(s.status) + '</span>';
+      }
+      if (!d.brewServices?.length) html += '<span>brew services unavailable</span>';
+      html += '<span style="margin-left:auto;font-family:monospace">' + _esc2(d.serversDir) + '</span>';
+      html += '</div>';
+
+      // nginx -t result
+      const testOk = (d.nginxTest || '').includes('test is successful');
+      html += '<div style="background:' + (testOk ? 'color-mix(in srgb, var(--green) 12%, transparent)' : 'color-mix(in srgb, var(--red) 10%, transparent)') + ';border:1px solid var(--border);padding:0.5rem 0.75rem;border-radius:4px;margin-bottom:1rem;font-size:0.75rem;font-family:monospace;white-space:pre-wrap;max-height:80px;overflow:auto">';
+      html += (testOk ? '✓ ' : '✗ ') + _esc2(d.nginxTest || '(no test output)');
+      html += '</div>';
+
+      // Action row
+      html += '<div style="display:flex;gap:0.5rem;margin-bottom:1rem">';
+      html += '<button class="btn action-btn" onclick="regenNginx(true)" title="Run gen-nginx-conf.sh in dry-run mode (preview only)">Preview regen</button>';
+      html += '<button class="btn btn-warn action-btn" onclick="regenNginx(false)" title="Run gen-nginx-conf.sh and write to disk; you must reload nginx manually">Regenerate</button>';
+      if (!d.genScriptExists) html += '<span style="color:var(--text-muted);align-self:center;font-size:0.75rem">⚠ gen script not found</span>';
+      html += '</div>';
+
+      // Server blocks table
+      if (d.blocks.length === 0) {
+        html += '<p style="color:var(--text-muted)">No server blocks parsed.</p>';
+      } else {
+        html += '<h3 style="font-size:0.9rem;margin:0 0 0.5rem">Server blocks (' + d.blocks.length + ')</h3>';
+        html += '<table style="width:100%;border-collapse:collapse;font-size:0.78rem">';
+        html += '<thead><tr style="text-align:left;color:var(--text-muted);border-bottom:1px solid var(--border)"><th style="padding:0.4rem 0.3rem">server_name</th><th>listen</th><th>proxy_pass</th><th>upstream</th><th>file</th></tr></thead><tbody>';
+        for (const b of d.blocks) {
+          const names = b.serverNames.join(' ') || '(none)';
+          const listens = b.listens.join(', ') || '(none)';
+          if (b.locations.length === 0) {
+            html += '<tr style="border-bottom:1px solid var(--border)"><td style="padding:0.3rem;font-family:monospace">' + _esc2(names) + '</td><td>' + _esc2(listens) + '</td><td colspan="2" style="color:var(--text-muted)">(no proxy_pass)</td><td style="font-family:monospace;color:var(--text-muted)">' + _esc2(b.file) + '</td></tr>';
+          } else {
+            for (const loc of b.locations) {
+              const aliveBadge = loc.upstreamPort
+                ? (loc.upstreamAlive ? '<span style="color:var(--green)">● alive</span>' : '<span style="color:var(--red)">● dead</span>')
+                : '<span style="color:var(--text-muted)">—</span>';
+              html += '<tr style="border-bottom:1px solid var(--border)">';
+              html += '<td style="padding:0.3rem;font-family:monospace">' + _esc2(names) + '</td>';
+              html += '<td style="font-family:monospace">' + _esc2(listens) + '</td>';
+              html += '<td style="font-family:monospace">' + _esc2(loc.proxyPass) + '</td>';
+              html += '<td>' + aliveBadge + '</td>';
+              html += '<td style="font-family:monospace;color:var(--text-muted)">' + _esc2(b.file) + '</td>';
+              html += '</tr>';
+            }
+          }
+        }
+        html += '</tbody></table>';
+      }
+
+      document.getElementById('nginx-content').innerHTML = html;
+    }
+
+    // ── Claude instances modal ────────────────────────────────────────────
+    let _claudeBadgeTimer = null;
+    async function updateClaudeBadge() {
+      try {
+        const data = await fetch('/api/claude-instances').then(r => r.json());
+        const interactive = data.instances.filter(i => !i.oneShot).length;
+        const btn = document.getElementById('claude-btn');
+        if (!btn) return;
+        let badge = btn.querySelector('.scan-badge');
+        if (interactive > 0) {
+          if (badge) badge.textContent = interactive;
+          else btn.insertAdjacentHTML('beforeend', '<span class="scan-badge">' + interactive + '</span>');
+        } else if (badge) badge.remove();
+      } catch {}
+    }
+
+    async function openClaudeModal() {
+      document.getElementById('claude-modal').classList.add('open');
+      document.getElementById('claude-content').innerHTML = '<p style="color:var(--text-muted)">Scanning…</p>';
+      try {
+        const data = await fetch('/api/claude-instances').then(r => r.json());
+        renderClaudeModal(data);
+      } catch (err) {
+        document.getElementById('claude-content').innerHTML = '<p style="color:var(--red)">Failed: ' + _esc2(err.message) + '</p>';
+      }
+    }
+
+    function renderClaudeModal(data) {
+      const interactive = data.instances.filter(i => !i.oneShot);
+      const oneShots = data.instances.filter(i => i.oneShot);
+      let html = '';
+      html += '<div style="display:flex;gap:1rem;margin-bottom:1rem;font-size:0.78rem;color:var(--text-muted)">';
+      html += '<span><strong style="color:var(--green)">' + interactive.length + '</strong> interactive</span>';
+      html += '<span><strong>' + oneShots.length + '</strong> one-shot (--print)</span>';
+      html += '<span style="margin-left:auto">scanned ' + new Date(data.scannedAt).toLocaleTimeString() + '</span>';
+      html += '</div>';
+      if (data.instances.length === 0) {
+        html += '<div style="padding:2rem;text-align:center;color:var(--text-muted);background:var(--bg-tertiary,#1a1a1a);border-radius:6px">No Claude CLI instances running.</div>';
+      } else {
+        html += '<table style="width:100%;border-collapse:collapse;font-size:0.78rem">';
+        html += '<thead><tr style="text-align:left;color:var(--text-muted);border-bottom:1px solid var(--border)">';
+        html += '<th style="padding:0.4rem 0.3rem">pid</th><th>model</th><th>type</th><th>uptime</th><th>cwd</th></tr></thead><tbody>';
+        const now = Date.now();
+        for (const i of [...interactive, ...oneShots]) {
+          const uptime = i.startedAt ? Math.floor((now - i.startedAt) / 1000) : null;
+          const utStr = uptime == null ? '—'
+            : uptime < 60 ? uptime + 's'
+            : uptime < 3600 ? Math.floor(uptime/60) + 'm'
+            : uptime < 86400 ? Math.floor(uptime/3600) + 'h'
+            : Math.floor(uptime/86400) + 'd';
+          html += '<tr style="border-bottom:1px solid var(--border)" title="' + _esc2(i.command) + '">';
+          html += '<td style="padding:0.35rem 0.3rem;font-family:monospace">' + i.pid + '</td>';
+          html += '<td style="font-family:monospace">' + _esc2(i.model || '—') + '</td>';
+          html += '<td>' + (i.oneShot ? '<span style="color:var(--text-muted)">one-shot</span>' : '<span style="color:var(--green)">interactive</span>') + '</td>';
+          html += '<td style="font-family:monospace;color:var(--text-muted)">' + utStr + '</td>';
+          html += '<td style="font-family:monospace;color:var(--text-muted)">' + _esc2((i.cwd || '').replace(/^\\/Users\\/[^\\/]+/, '~')) + '</td>';
+          html += '</tr>';
+        }
+        html += '</tbody></table>';
+      }
+      document.getElementById('claude-content').innerHTML = html;
+    }
+
+    updateClaudeBadge();
+    setInterval(updateClaudeBadge, 30000);
+
+    async function regenNginx(dryRun) {
+      try {
+        const res = await fetch('/api/nginx/regen', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ dryRun }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          toast(dryRun ? 'Preview generated' : 'Regenerated — reload nginx manually (sudo nginx -s reload)', 'ok');
+          alert((dryRun ? 'Preview output:' : 'Generated. nginx -t result:') + '\\n\\n' + (data.output || data.nginxTest || '(no output)'));
+        } else {
+          toast('Regen failed: ' + (data.error || 'unknown'), 'err');
+          alert('Failed:\\n' + (data.error || data.output || ''));
+        }
+      } catch (err) { toast('Regen failed: ' + err.message, 'err'); }
+      openNginxModal();
+    }
+
+    // ── Item Detail (source + tags) modal ────────────────────────────────
+    // Shared across pm2 / daemon / cron / launchd. Two sections per item:
+    //   1. Source — read-only fields specific to the type
+    //   2. Tags   — editable, persisted by stableKey(type,key) so they survive
+    //               restarts, reboots, and rediscovery (key is derived from
+    //               the most stable identifier each type has, never the pid).
+    async function openItemDetail(type, key, displayName) {
+      document.getElementById('detail-title').textContent =
+        (displayName || key) + '  —  ' + type;
+      document.getElementById('detail-modal').classList.add('open');
+      document.getElementById('detail-content').innerHTML = '<p style="color:var(--text-muted)">Loading…</p>';
+      let data;
+      try {
+        const res = await fetch('/api/' + _detailPath(type) + '/' + encodeURIComponent(key) + '/source');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        data = await res.json();
+      } catch (err) {
+        document.getElementById('detail-content').innerHTML =
+          '<p style="color:var(--red)">Failed to load: ' + _esc2(err.message) + '</p>';
+        return;
+      }
+      _renderItemDetail(data);
+    }
+
+    function _detailPath(type) {
+      return ({ pm2: 'pm2', daemon: 'daemons', cron: 'crons', launchd: 'launchd' })[type] || type;
+    }
+
+    function _renderItemDetail(d) {
+      const tags = d.tags || [];
+      let html = '';
+
+      // ── Source section ────────────────────────────────────────────────
+      html += '<h3 style="font-size:0.9rem;margin:0 0 0.5rem;color:var(--text-muted)">Source</h3>';
+      html += '<div style="background:var(--bg-tertiary,#1a1a1a);padding:0.75rem;border-radius:4px;font-family:monospace;font-size:0.78rem;line-height:1.5;margin-bottom:1rem;white-space:pre-wrap;word-break:break-word">';
+
+      if (d.type === 'daemon') {
+        html += '<strong>command:</strong>  ' + _esc2(d.command || '(none)') + '\\n';
+        html += '<strong>workdir:</strong>  ' + _esc2(d.workdir || '(default)') + '\\n';
+        html += '<strong>autoRestart:</strong> ' + (d.autoRestart ? 'yes' : 'no') + '  (max ' + d.maxRestarts + ', delay ' + d.restartDelay + 'ms)\\n';
+        if (d.logFile)  html += '<strong>stdout:</strong>   ' + _esc2(d.logFile) + '\\n';
+        if (d.errFile)  html += '<strong>stderr:</strong>   ' + _esc2(d.errFile) + '\\n';
+        if (d.pidFile)  html += '<strong>pidFile:</strong>  ' + _esc2(d.pidFile) + '\\n';
+        const envKeys = Object.keys(d.env || {});
+        if (envKeys.length) {
+          html += '\\n<strong>env (' + envKeys.length + ' keys):</strong>\\n';
+          for (const k of envKeys) html += '  ' + _esc2(k) + '=' + _esc2(d.env[k]) + '\\n';
+        }
+      } else if (d.type === 'cron') {
+        html += '<strong>schedule:</strong> ' + _esc2(d.schedule) + '\\n';
+        html += '<strong>human:</strong>    ' + _esc2(d.humanSchedule || '(unparsed)') + '\\n';
+        html += '<strong>command:</strong>  ' + _esc2(d.command) + '\\n';
+        html += '<strong>enabled:</strong>  ' + (d.enabled ? 'yes' : 'no  (overridden via cronOverrides)') + '\\n';
+        if (d.nextRun) html += '<strong>next run:</strong> ' + new Date(d.nextRun).toLocaleString() + '\\n';
+        html += '<strong>source:</strong>   ' + _esc2(d.crontabPath) + '\\n';
+        html += '\\n<strong>raw line:</strong>\\n  ' + _esc2(d.rawLine);
+      } else if (d.type === 'launchd') {
+        html += '<strong>label:</strong>    ' + _esc2(d.label) + '\\n';
+        html += '<strong>plist:</strong>    ' + _esc2(d.plistPath || '(unknown)') + '\\n';
+        html += '<strong>runAtLoad:</strong> ' + (d.runAtLoad ? 'yes' : 'no') + '\\n';
+        html += '<strong>keepAlive:</strong> ' + (d.keepAlive == null ? 'no' : (typeof d.keepAlive === 'object' ? JSON.stringify(d.keepAlive) : String(d.keepAlive))) + '\\n';
+        if (d.program) html += '<strong>program:</strong>  ' + _esc2(d.program) + '\\n';
+        if (Array.isArray(d.programArguments) && d.programArguments.length) {
+          html += '<strong>args:</strong>\\n';
+          for (const a of d.programArguments) html += '  ' + _esc2(a) + '\\n';
+        }
+        if (d.stdoutPath) html += '<strong>stdout:</strong>   ' + _esc2(d.stdoutPath) + '\\n';
+        if (d.stderrPath) html += '<strong>stderr:</strong>   ' + _esc2(d.stderrPath) + '\\n';
+        if (d.plistRaw) {
+          html += '\\n<details><summary style="cursor:pointer;color:var(--text-muted)">show raw plist (' + (d.plistRaw.length) + ' bytes)</summary>';
+          html += '<pre style="margin:0.5rem 0 0;font-size:0.72rem;white-space:pre-wrap">' + _esc2(d.plistRaw) + '</pre></details>';
+        }
+      } else if (d.type === 'pm2') {
+        html += '<strong>script:</strong>      ' + _esc2(d.script || '(unknown)') + '\\n';
+        html += '<strong>cwd:</strong>         ' + _esc2(d.cwd || '(unknown)') + '\\n';
+        html += '<strong>execMode:</strong>    ' + _esc2(d.execMode || 'fork') + '\\n';
+        html += '<strong>interpreter:</strong> ' + _esc2(d.interpreter || 'default') + '\\n';
+        if (Array.isArray(d.args) && d.args.length) html += '<strong>args:</strong>        ' + _esc2(d.args.join(' ')) + '\\n';
+        if (d.ecosystemFile) html += '<strong>ecosystem:</strong>   ' + _esc2(d.ecosystemFile) + ' (best-guess path)\\n';
+        const envKeys = Object.keys(d.env || {});
+        if (envKeys.length) {
+          html += '\\n<strong>env (' + envKeys.length + ' keys):</strong>\\n';
+          for (const k of envKeys) html += '  ' + _esc2(k) + '=' + _esc2(d.env[k]) + '\\n';
+        }
+      }
+      html += '</div>';
+
+      // ── Tags section ──────────────────────────────────────────────────
+      html += '<h3 style="font-size:0.9rem;margin:0 0 0.5rem;color:var(--text-muted)">Tags <span style="font-size:0.7rem;font-weight:normal;color:var(--text-muted)">(stableKey: ' + _esc2(d.stableKey) + ')</span></h3>';
+      html += '<div style="display:flex;flex-wrap:wrap;gap:0.4rem;margin-bottom:0.5rem" id="detail-tag-list">';
+      if (tags.length === 0) html += '<em style="color:var(--text-muted);font-size:0.78rem">no tags yet</em>';
+      else for (const t of tags) {
+        html += '<span class="tag-pill" style="background:var(--bg-tertiary,#222);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:10px;font-size:0.75rem;display:inline-flex;align-items:center;gap:0.3rem">';
+        html += _esc2(t);
+        html += '<button onclick="_removeTag(' + JSON.stringify(d.type).replace(/"/g, '&quot;') + ',' + JSON.stringify(d.key).replace(/"/g, '&quot;') + ',' + JSON.stringify(t).replace(/"/g, '&quot;') + ')" style="background:none;border:0;color:var(--text-muted);cursor:pointer;padding:0;font-size:0.85rem;line-height:1" title="Remove tag">×</button>';
+        html += '</span>';
+      }
+      html += '</div>';
+      html += '<div style="display:flex;gap:0.4rem;align-items:center">';
+      html += '<input type="text" id="detail-tag-input" placeholder="add tag and press Enter" style="flex:1;padding:0.3rem 0.5rem;background:var(--bg-tertiary,#1a1a1a);border:1px solid var(--border);color:var(--text);border-radius:3px;font-size:0.78rem" onkeydown="if(event.key===\\\'Enter\\\')_addTag(' + JSON.stringify(d.type).replace(/"/g, '&quot;') + ',' + JSON.stringify(d.key).replace(/"/g, '&quot;') + ')">';
+      html += '</div>';
+      html += '<p style="margin-top:0.75rem;font-size:0.72rem;color:var(--text-muted)">Tags persist by <code>' + _esc2(d.stableKey) + '</code> — they survive restarts, reboots, and rediscovery. They\\\'re lost only if the underlying identifier changes (e.g. the pm2 name is renamed, the cron line is rewritten, the plist Label changes).</p>';
+
+      document.getElementById('detail-content').innerHTML = html;
+    }
+
+    async function _setTags(type, key, tags) {
+      const url = '/api/tags/' + encodeURIComponent(type) + '/' + encodeURIComponent(key);
+      const res = await fetch(url, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tags }),
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    }
+
+    async function _addTag(type, key) {
+      const input = document.getElementById('detail-tag-input');
+      const t = (input?.value || '').trim();
+      if (!t) return;
+      // re-fetch current to avoid race
+      const cur = await fetch('/api/tags/' + encodeURIComponent(type) + '/' + encodeURIComponent(key)).then(r => r.json());
+      const next = [...new Set([...(cur.tags || []), t])];
+      try {
+        await _setTags(type, key, next);
+        toast('Tag added: ' + t, 'ok');
+        openItemDetail(type, key);
+      } catch (err) { toast('Tag add failed: ' + err.message, 'err'); }
+    }
+
+    async function _removeTag(type, key, tag) {
+      const cur = await fetch('/api/tags/' + encodeURIComponent(type) + '/' + encodeURIComponent(key)).then(r => r.json());
+      const next = (cur.tags || []).filter(t => t !== tag);
+      try {
+        await _setTags(type, key, next);
+        toast('Tag removed: ' + tag, 'ok');
+        openItemDetail(type, key);
+      } catch (err) { toast('Tag remove failed: ' + err.message, 'err'); }
+    }
   </script>
 </body>
 </html>`;
@@ -7309,6 +8189,489 @@ function handleRequest(req, res) {
       hostname: os.hostname(),
       port: PORT,
     }));
+    return;
+  }
+
+  // ── sys-pier: port discovery ────────────────────────────────────────────
+  // GET /api/ports/discover — enumerate all listening TCP sockets, classify
+  //   each as pm2 / system / orphan / ignored, enrich orphans with cwd + cmdline.
+  //   Query: ?enrich=0 to skip orphan enrichment for a faster scan.
+  if (req.method === 'GET' && path === '/api/ports/discover') {
+    const enrich = urlObj.searchParams.get('enrich') !== '0';
+    const result = portScanner.discover({
+      pm2List: pm2List(),
+      config: CONFIG,
+      enrichOrphans: enrich,
+    });
+    result.adoptQueue = CONFIG.portScanner?.adoptQueue || [];
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify(result));
+    return;
+  }
+
+  // GET /api/ports/conflict?port=N — pre-flight check for a single port.
+  //   Returns the blocker process if bound, or null if free.
+  if (req.method === 'GET' && path === '/api/ports/conflict') {
+    const port = parseInt(urlObj.searchParams.get('port') || '', 10);
+    if (!Number.isFinite(port) || port < 1 || port > 65535) {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'port query parameter required (1-65535)' }));
+      return;
+    }
+    const blocker = portScanner.checkConflict(port);
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ port, free: blocker === null, blocker }));
+    return;
+  }
+
+  // POST /api/ports/ignore — add a "command:port" key to the ignored list so
+  //   it stops appearing in the orphan tray. Body: { command, port }
+  if (req.method === 'POST' && path === '/api/ports/ignore') {
+    parseBody(req).then((body) => {
+      if (!body.command || !Number.isFinite(parseInt(body.port, 10))) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'command (string) and port (number) required' }));
+        return;
+      }
+      const key = `${body.command}:${parseInt(body.port, 10)}`;
+      if (!CONFIG.portScanner) CONFIG.portScanner = { systemAllowlist: [], ignored: [] };
+      if (!CONFIG.portScanner.ignored.includes(key)) {
+        CONFIG.portScanner.ignored.push(key);
+        saveConfig();
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true, ignored: CONFIG.portScanner.ignored }));
+    }).catch((err) => {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    });
+    return;
+  }
+
+  // POST /api/ports/allowlist — add a command name to systemAllowlist so all
+  //   current AND future ports it binds vanish from the orphan tray.
+  //   Body: { command } — e.g. "Linear Helper", "mongod"
+  if (req.method === 'POST' && path === '/api/ports/allowlist') {
+    parseBody(req).then((body) => {
+      if (!body.command || typeof body.command !== 'string') {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'command (string) required' }));
+        return;
+      }
+      if (!CONFIG.portScanner) CONFIG.portScanner = { systemAllowlist: [], ignored: [] };
+      if (!CONFIG.portScanner.systemAllowlist) CONFIG.portScanner.systemAllowlist = [];
+      if (!CONFIG.portScanner.systemAllowlist.includes(body.command)) {
+        CONFIG.portScanner.systemAllowlist.push(body.command);
+        saveConfig();
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true, systemAllowlist: CONFIG.portScanner.systemAllowlist }));
+    }).catch((err) => {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    });
+    return;
+  }
+
+  // POST /api/ports/kill — send a signal to a pid. Body: { pid, signal? = "TERM" }
+  //   Used to clean up stale ad-hoc processes from the orphan tray.
+  if (req.method === 'POST' && path === '/api/ports/kill') {
+    parseBody(req).then((body) => {
+      const pid = parseInt(body.pid, 10);
+      if (!Number.isFinite(pid) || pid < 2) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'pid (number, >=2) required' }));
+        return;
+      }
+      const signal = (body.signal || 'TERM').replace(/^SIG/i, '').toUpperCase();
+      if (!/^(TERM|KILL|INT|HUP|QUIT|USR1|USR2)$/.test(signal)) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'unsupported signal' }));
+        return;
+      }
+      try {
+        process.kill(pid, 'SIG' + signal);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, pid, signal }));
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, pid, error: err.message }));
+      }
+    }).catch((err) => {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    });
+    return;
+  }
+
+  // ── sys-pier: claude instances ───────────────────────────────────────────
+  // GET /api/claude-instances — list every live `claude` CLI process with
+  // pid, cwd (via lsof), model flag, and start time. Direct read; no adapter
+  // contract needed — `pgrep` is the producer.
+  if (req.method === 'GET' && path === '/api/claude-instances') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify(scanClaudeInstances()));
+    return;
+  }
+
+  // ── sys-pier: nginx surface ─────────────────────────────────────────────
+  // GET /api/nginx — parse nginx server blocks, return service state + alive
+  // status for each upstream by cross-referencing the port scanner.
+  if (req.method === 'GET' && path === '/api/nginx') {
+    const result = scanNginx();
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify(result));
+    return;
+  }
+
+  // POST /api/nginx/regen — runs gen-nginx-conf.sh, then `nginx -t` + reload
+  // (reload requires sudo; we surface the test result and let user reload manually).
+  if (req.method === 'POST' && path === '/api/nginx/regen') {
+    parseBody(req).then((body) => {
+      const dryRun = !!body.dryRun;
+      const script = `${os.homedir()}/.claude/scripts/dev-servers/gen-nginx-conf.sh`;
+      try {
+        const out = run(`${script}${dryRun ? ' --dry-run' : ''} 2>&1`, {
+          encoding: 'utf-8', timeout: 15000,
+        }).toString();
+        let testOut = '';
+        try { testOut = run('nginx -t 2>&1', { encoding: 'utf-8', timeout: 5000 }).toString(); } catch (e) { testOut = e.stdout || e.message; }
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, dryRun, output: out, nginxTest: testOut }));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: e.message, output: e.stdout || '' }));
+      }
+    }).catch((err) => {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    });
+    return;
+  }
+
+  // ── sys-pier: intensity ─────────────────────────────────────────────────
+  // GET /api/intensity  → { intensity, profiles, profile }
+  // PUT /api/intensity  body { intensity: "eco"|"normal"|"aggressive" }
+  if (req.method === 'GET' && path === '/api/intensity') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({
+      intensity: CONFIG.intensity || 'normal',
+      profiles: INTENSITY_PROFILES,
+      profile: currentIntensityProfile(),
+    }));
+    return;
+  }
+  if (req.method === 'PUT' && path === '/api/intensity') {
+    parseBody(req).then((body) => {
+      const v = body.intensity;
+      if (!INTENSITY_PROFILES[v]) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'intensity must be eco | normal | aggressive' }));
+        return;
+      }
+      CONFIG.intensity = v;
+      saveConfig();
+      rescheduleLaunchdWarmer(); // pick up new cadence on next tick
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true, intensity: v, profile: currentIntensityProfile() }));
+    }).catch((err) => {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    });
+    return;
+  }
+
+  // ── sys-pier: tags ──────────────────────────────────────────────────────
+  // Cross-cutting tags keyed by stableKey(type, key). See header for stable-key rules.
+  // GET    /api/tags                       → entire tag map
+  // GET    /api/tags/:type/:key            → tags for one item
+  // PUT    /api/tags/:type/:key  body {tags: string[]} → replace
+  // DELETE /api/tags/:type/:key            → clear
+  if (req.method === 'GET' && path === '/api/tags') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ tags: CONFIG.tags || {} }));
+    return;
+  }
+  {
+    const m = path.match(/^\/api\/tags\/([^/]+)\/(.+)$/);
+    if (m) {
+      const type = decodeURIComponent(m[1]);
+      const key = decodeURIComponent(m[2]);
+      const sk = stableKey(type, key);
+      if (!CONFIG.tags) CONFIG.tags = {};
+      if (req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ type, key, stableKey: sk, tags: CONFIG.tags[sk] || [] }));
+        return;
+      }
+      if (req.method === 'PUT') {
+        parseBody(req).then((body) => {
+          const tags = Array.isArray(body.tags) ? body.tags.map(String).map(t => t.trim()).filter(Boolean) : [];
+          if (tags.length === 0) delete CONFIG.tags[sk];
+          else CONFIG.tags[sk] = [...new Set(tags)];
+          saveConfig();
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, stableKey: sk, tags: CONFIG.tags[sk] || [] }));
+        }).catch((err) => {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: err.message }));
+        });
+        return;
+      }
+      if (req.method === 'DELETE') {
+        delete CONFIG.tags[sk];
+        saveConfig();
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, stableKey: sk }));
+        return;
+      }
+    }
+  }
+
+  // ── sys-pier: view source ───────────────────────────────────────────────
+  // GET /api/daemons/:key/source — the start command + workdir + env
+  if (req.method === 'GET' && path.match(/^\/api\/daemons\/[^/]+\/source$/)) {
+    const key = decodeURIComponent(path.slice('/api/daemons/'.length, -'/source'.length));
+    const cfg = CONFIG.daemons?.[key];
+    if (!cfg) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Daemon not found' }));
+      return;
+    }
+    const sk = stableKey('daemon', key);
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({
+      type: 'daemon', key, stableKey: sk,
+      command: cfg.command || '',
+      workdir: cfg.workdir || '',
+      env: cfg.env || {},
+      autoRestart: !!cfg.autoRestart,
+      maxRestarts: cfg.maxRestarts ?? 5,
+      restartDelay: cfg.restartDelay ?? 3000,
+      logFile: cfg.logFile || null,
+      errFile: cfg.errFile || null,
+      pidFile: cfg.pidFile || null,
+      tags: CONFIG.tags?.[sk] || [],
+    }));
+    return;
+  }
+
+  // GET /api/crons/:id/source — the original crontab line + parsed schedule
+  if (req.method === 'GET' && path.match(/^\/api\/crons\/[^/]+\/source$/)) {
+    const id = decodeURIComponent(path.slice('/api/crons/'.length, -'/source'.length));
+    const all = parseCrontab();
+    const cron = all.find((c) => c.id === id);
+    if (!cron) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Cron entry not found' }));
+      return;
+    }
+    const sk = stableKey('cron', id);
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({
+      type: 'cron', key: id, stableKey: sk,
+      schedule: cron.schedule,
+      command: cron.command,
+      rawLine: cron.rawLine || `${cron.schedule} ${cron.command}`,
+      humanSchedule: cronToHuman(cron.schedule),
+      nextRun: cronNextRun(cron.schedule),
+      enabled: cron.enabled !== false,
+      crontabPath: 'user crontab (crontab -e)',
+      tags: CONFIG.tags?.[sk] || [],
+    }));
+    return;
+  }
+
+  // GET /api/launchd/:label/source — plist file path + raw content + parsed
+  if (req.method === 'GET' && path.match(/^\/api\/launchd\/[^/]+\/source$/)) {
+    const label = decodeURIComponent(path.slice('/api/launchd/'.length, -'/source'.length));
+    const agent = listLaunchAgents().find((a) => a.label === label);
+    if (!agent) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Agent not found' }));
+      return;
+    }
+    let plistRaw = '';
+    let plistJson = null;
+    if (agent.plistPath) {
+      try { plistRaw = fs.readFileSync(agent.plistPath, 'utf-8'); } catch (e) { plistRaw = `(read failed: ${e.message})`; }
+      try { plistJson = JSON.parse(run(`plutil -convert json -o - ${JSON.stringify(agent.plistPath)}`, { encoding: 'utf-8', timeout: 3000 })); } catch {}
+    }
+    const sk = stableKey('launchd', label);
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({
+      type: 'launchd', key: label, stableKey: sk,
+      label,
+      plistPath: agent.plistPath || null,
+      plistRaw,
+      plistParsed: plistJson,
+      program: plistJson?.Program || null,
+      programArguments: plistJson?.ProgramArguments || null,
+      runAtLoad: !!plistJson?.RunAtLoad,
+      keepAlive: plistJson?.KeepAlive ?? null,
+      stdoutPath: agent.stdoutPath || null,
+      stderrPath: agent.stderrPath || null,
+      tags: CONFIG.tags?.[sk] || [],
+    }));
+    return;
+  }
+
+  // GET /api/pm2/:name/source — the ecosystem config entry for a pm2 process.
+  // Best-effort: pm2 jlist already exposes script + cwd + env + args.
+  if (req.method === 'GET' && path.match(/^\/api\/pm2\/[^/]+\/source$/)) {
+    const name = decodeURIComponent(path.slice('/api/pm2/'.length, -'/source'.length));
+    const proc = pm2Find(name);
+    if (!proc) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'pm2 process not found' }));
+      return;
+    }
+    const env = proc.pm2_env || {};
+    const sk = stableKey('pm2', name);
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({
+      type: 'pm2', key: name, stableKey: sk,
+      script: env.pm_exec_path || env.script || null,
+      cwd: env.pm_cwd || env.cwd || null,
+      args: env.args || [],
+      execMode: env.exec_mode || null,
+      interpreter: env.exec_interpreter || null,
+      ecosystemFile: env.pm_cwd ? `${env.pm_cwd}/ecosystem.config.cjs` : null,
+      env: Object.fromEntries(
+        Object.entries(env.env || {}).map(([k, v]) =>
+          [k, /SECRET|KEY|PASSWORD|TOKEN|PASS/i.test(k) ? '<redacted>' : v]
+        )
+      ),
+      tags: CONFIG.tags?.[sk] || [],
+    }));
+    return;
+  }
+
+  // POST /api/ports/adopt-queue/process — drain the adopt queue.
+  //   For each queued entry: walk up from cwd to find ecosystem.config.{cjs,js,mjs},
+  //   SIGTERM the bare process (escalate to SIGKILL after 2s if still alive),
+  //   then `pm2 start <ecosystem> --only <suggestedName>` and `pm2 save`.
+  //   Body (optional): { preview: true } — returns the plan without executing.
+  if (req.method === 'POST' && path === '/api/ports/adopt-queue/process') {
+    parseBody(req).then(async (body) => {
+      const preview = !!body.preview;
+      const queue = (CONFIG.portScanner?.adoptQueue || []).slice();
+      const results = [];
+      for (const entry of queue) {
+        const r = { port: entry.port, suggestedName: entry.suggestedName, steps: [] };
+        // 1. Find ecosystem file
+        const eco = findEcosystemUp(entry.cwd);
+        if (!eco) {
+          r.ok = false;
+          r.error = 'no ecosystem.config.{cjs,js,mjs} found in cwd or parents';
+          r.steps.push({ step: 'find-ecosystem', ok: false, detail: entry.cwd });
+          results.push(r);
+          continue;
+        }
+        r.ecosystem = eco;
+        r.steps.push({ step: 'find-ecosystem', ok: true, detail: eco });
+        if (preview) { r.ok = true; r.steps.push({ step: 'preview-only', ok: true }); results.push(r); continue; }
+
+        // 2. SIGTERM the bare process. Confirm pid still belongs to that command first.
+        try {
+          const psOut = run(`ps -p ${entry.pid} -o command= 2>/dev/null`, { encoding: 'utf-8', timeout: 2000 }).toString().trim();
+          if (!psOut) {
+            r.steps.push({ step: 'kill-bare', ok: true, detail: 'pid already gone' });
+          } else {
+            try { process.kill(entry.pid, 'SIGTERM'); } catch {}
+            await new Promise(res => setTimeout(res, 2000));
+            try {
+              process.kill(entry.pid, 0); // alive check
+              try { process.kill(entry.pid, 'SIGKILL'); } catch {}
+              r.steps.push({ step: 'kill-bare', ok: true, detail: 'SIGKILL after SIGTERM timeout' });
+            } catch {
+              r.steps.push({ step: 'kill-bare', ok: true, detail: 'exited on SIGTERM' });
+            }
+          }
+        } catch (e) {
+          r.steps.push({ step: 'kill-bare', ok: false, detail: e.message });
+        }
+
+        // 3. pm2 start <ecosystem> --only <name>
+        try {
+          const cmd = entry.suggestedName
+            ? `pm2 start ${JSON.stringify(eco)} --only ${JSON.stringify(entry.suggestedName)}`
+            : `pm2 start ${JSON.stringify(eco)}`;
+          const out = run(cmd, { encoding: 'utf-8', timeout: 20000 }).toString();
+          r.steps.push({ step: 'pm2-start', ok: true, detail: out.split('\n').filter(Boolean).slice(-3).join(' | ') });
+          invalidatePm2Cache();
+        } catch (e) {
+          r.steps.push({ step: 'pm2-start', ok: false, detail: e.message });
+          r.ok = false;
+          results.push(r);
+          continue;
+        }
+
+        // 4. pm2 save
+        try {
+          run('pm2 save', { encoding: 'utf-8', timeout: 10000 });
+          r.steps.push({ step: 'pm2-save', ok: true });
+        } catch (e) {
+          r.steps.push({ step: 'pm2-save', ok: false, detail: e.message });
+        }
+
+        // 5. Remove from queue
+        CONFIG.portScanner.adoptQueue = CONFIG.portScanner.adoptQueue.filter(
+          q => !(q.port === entry.port && q.pid === entry.pid)
+        );
+        saveConfig();
+        r.ok = true;
+        results.push(r);
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({
+        ok: results.every(r => r.ok),
+        processed: results.length,
+        results,
+        remainingQueue: CONFIG.portScanner?.adoptQueue?.length || 0,
+      }));
+    }).catch((err) => {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    });
+    return;
+  }
+
+  // POST /api/ports/adopt — queue an orphan for pm2 adoption. Body:
+  //   { port, pid, command, cwd, suggestedName? }
+  //   STUB: appends to portScanner.adoptQueue. The actual pm2-start happens
+  //   in the M2 follow-up (full adoption flow). Returns the queued entry.
+  if (req.method === 'POST' && path === '/api/ports/adopt') {
+    parseBody(req).then((body) => {
+      const port = parseInt(body.port, 10);
+      const pid = parseInt(body.pid, 10);
+      if (!Number.isFinite(port) || !Number.isFinite(pid)) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'port and pid required' }));
+        return;
+      }
+      if (!CONFIG.portScanner) CONFIG.portScanner = { systemAllowlist: [], ignored: [] };
+      if (!Array.isArray(CONFIG.portScanner.adoptQueue)) CONFIG.portScanner.adoptQueue = [];
+      const entry = {
+        port, pid,
+        command: body.command || '',
+        cwd: body.cwd || '',
+        suggestedName: body.suggestedName || '',
+        queuedAt: Date.now(),
+      };
+      // Dedupe by (port, pid)
+      CONFIG.portScanner.adoptQueue = CONFIG.portScanner.adoptQueue.filter(
+        e => !(e.port === port && e.pid === pid)
+      );
+      CONFIG.portScanner.adoptQueue.push(entry);
+      saveConfig();
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true, queued: entry, queueSize: CONFIG.portScanner.adoptQueue.length }));
+    }).catch((err) => {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    });
     return;
   }
 
@@ -7953,13 +9316,13 @@ function handleRequest(req, res) {
     const endpoints = API_DOCS.endpoints.map((ep) =>
       `<tr><td><code>${ep.method}</code></td><td><code>${ep.path}</code></td><td>${ep.description}</td></tr>`
     ).join('');
-    const html = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>pm2 Manager API</title>
+    const html = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>sys-pier API</title>
     <style>body{font-family:system-ui,-apple-system,sans-serif;background:#0d1117;color:#e1e4e8;margin:2rem;line-height:1.6}
     h1{color:#58a6ff}table{border-collapse:collapse;width:100%}th,td{border:1px solid #30363d;padding:8px 12px;text-align:left}
     th{background:#161b22;color:#8b949e}code{background:#161b22;padding:2px 6px;border-radius:3px;font-size:0.9em;color:#58a6ff}
     tr:hover{background:#161b22}a{color:#58a6ff}.note{color:#8b949e;font-size:0.85em;margin-top:2rem}
     pre{background:#161b22;padding:12px;border-radius:6px;overflow-x:auto;border:1px solid #30363d}</style></head>
-    <body><h1>pm2 Manager API</h1><p>Version ${API_DOCS.version} — ${API_DOCS.security}</p>
+    <body><h1>sys-pier API</h1><p>Version ${API_DOCS.version} — ${API_DOCS.security}</p>
     <p>${API_DOCS.note}</p><table><thead><tr><th>Method</th><th>Path</th><th>Description</th></tr></thead><tbody>${endpoints}</tbody></table>
     <h2>Quick Reference for Claude Code / Scripts</h2>
     <pre><code># Restart a specific process
@@ -8298,7 +9661,7 @@ if (process.env.PM2_MANAGE_TEST) {
 } else {
   const server = http.createServer(handleRequest);
   server.listen(PORT, HOST, () => {
-    console.log(`\n  pm2 Manager`);
+    console.log(`\n  sys-pier`);
     console.log(`  ─────────────────────────────────────`);
     console.log(`  Local:   http://localhost:${PORT}`);
     console.log(`  Proxy:   http://local.${PORT}.run`);

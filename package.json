@@ -1,13 +1,20 @@
 {
-  "name": "pm2-manage",
+  "name": "sys-pier",
   "version": "1.0.0",
-  "description": "Browser dashboard for pm2 process management",
+  "description": "Local dev resource management dashboard — pm2, daemons, cron, launchd, ports, nginx, claude instances",
   "main": "server.cjs",
   "scripts": {
     "start": "node server.cjs",
     "pm2:start": "pm2 start ecosystem.config.cjs",
-    "pm2:stop": "pm2 delete pm2-manage-backend 2>/dev/null; true",
-    "pm2:restart": "pm2 restart pm2-manage-backend",
-    "pm2:logs": "pm2 logs pm2-manage-backend"
+    "pm2:stop": "pm2 delete sys-pier-backend 2>/dev/null; true",
+    "pm2:restart": "pm2 restart sys-pier-backend",
+    "pm2:logs": "pm2 logs sys-pier-backend",
+    "test:unit": "SYS_PIER_TEST=1 PM2_MANAGE_TEST=1 node --test tests/unit.test.mjs",
+    "test:api": "node --test tests/api.test.mjs",
+    "test:ui": "npx playwright test tests/ui.spec.mjs --config playwright.config.mjs",
+    "test": "npm run test:unit && npm run test:api && npm run test:ui"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1"
   }
 }
