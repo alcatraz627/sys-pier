@@ -25,6 +25,7 @@ const { execSync, exec, spawn } = require('child_process');
 const os = require('os');
 const fs = require('fs');
 const portScanner = require('./port-scanner.cjs');
+const registry = require('./core/registry.cjs');
 
 // Guarantee full PATH for all shell commands — pm2 LaunchAgent runs with a stripped PATH
 // that may omit /opt/homebrew/bin (pm2, brew tools) and even /usr/bin (id, crontab).
@@ -8131,6 +8132,76 @@ const API_DOCS = {
 
 // ── Request Handler ────────────────────────────────────────────────────────
 
+// ── M4 Phase 1 — generic adapter request handler ──────────────────────────
+// Routes:
+//   GET  /api/items                       → { adapters: [id, ...] }
+//   GET  /api/items/:type                 → adapter.list()
+//   GET  /api/items/:type/:id             → adapter.detail(id)
+//   POST /api/items/:type/:id/:action     → adapter.actions[action].run(id, body)
+//
+// Empty registry → 404 for all type-specific routes (correct for Phase 1
+// when no adapters have been migrated yet). Per-type routes elsewhere in
+// this file continue to serve real traffic during migration.
+async function handleItemsRequest(req, res, urlPath, urlObj) {
+  const json = (code, body) => {
+    res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify(body));
+  };
+
+  if (req.method === 'GET' && urlPath === '/api/items') {
+    return json(200, { adapters: registry.ids() });
+  }
+
+  const parts = urlPath.split('/').filter(Boolean); // ['api', 'items', type?, id?, action?]
+  const type = parts[2];
+  const id = parts[3];
+  const action = parts[4];
+  if (!type) return json(404, { error: 'item type required' });
+
+  const adapter = registry.get(type);
+  if (!adapter) return json(404, { error: `unknown adapter type: ${type}` });
+
+  try {
+    if (req.method === 'GET' && !id) {
+      return json(200, await adapter.list());
+    }
+    if (req.method === 'GET' && id && !action) {
+      const item = await adapter.detail(id);
+      return item == null ? json(404, { error: 'not found' }) : json(200, item);
+    }
+    if (req.method === 'POST' && id && action) {
+      const def = adapter.actions[action];
+      if (!def) return json(404, { error: `unknown action: ${action}` });
+      const body = await readJsonBody(req);
+      const result = await def.run(id, body || {});
+      // Cross-adapter cache busting per contract
+      if (Array.isArray(adapter.mutationsInvalidate)) {
+        for (const otherId of adapter.mutationsInvalidate) {
+          const other = registry.get(otherId);
+          if (other && typeof other.invalidate === 'function') other.invalidate();
+        }
+      }
+      return json(200, result == null ? { ok: true } : result);
+    }
+    return json(405, { error: `method ${req.method} not allowed for ${urlPath}` });
+  } catch (err) {
+    return json(500, { error: err && err.message || String(err) });
+  }
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 1_000_000) req.destroy(); });
+    req.on('end', () => {
+      if (!body) return resolve(null);
+      try { resolve(JSON.parse(body)); } catch (e) { reject(new Error('invalid JSON body')); }
+    });
+    req.on('error', reject);
+  });
+}
+// ──────────────────────────────────────────────────────────────────────────
+
 function handleRequest(req, res) {
   if (!isLocalRequest(req)) {
     res.writeHead(403, { 'Content-Type': 'application/json' });
@@ -8140,6 +8211,20 @@ function handleRequest(req, res) {
 
   const urlObj = new URL(req.url, `http://localhost`);
   const path = urlObj.pathname;
+
+  // ── M4 Phase 1 — generic adapter routes ─────────────────────────────────
+  // Empty registry → all /api/items/* return 404. /api/bootstrap returns {}.
+  // Routes activate as adapters register; existing per-type routes below
+  // continue to work in parallel during the migration.
+  if (req.method === 'GET' && path === '/api/bootstrap') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ adapters: registry.ids() }));
+    return;
+  }
+  if (path === '/api/items' || path.startsWith('/api/items/')) {
+    return handleItemsRequest(req, res, path, urlObj);
+  }
+  // ────────────────────────────────────────────────────────────────────────
 
   if (req.method === 'GET' && path === '/') {
     const processes = pm2List();
