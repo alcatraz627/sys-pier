@@ -1913,447 +1913,18 @@ function toStatusBucket(type, rawStatus) {
   return 'stopped';
 }
 
-/** @type {Record<string, {type,icon,label,availableActions,tableColumns,collect,action,detail,logs}>} */
-const ITEM_ADAPTERS = {
-
-  // ── pm2 processes ──────────────────────────────────────────────────────────
-  pm2: {
-    type: 'pm2', icon: '▶', label: 'pm2',
-    availableActions: ['start','stop','restart','reload','delete','logs','detail','signal','scale'],
-    tableColumns: [
-      { id: 'status',   label: '',          align: 'center', width: '2rem'  },
-      { id: 'name',     label: 'name',      sortable: true                  },
-      { id: 'port',     label: 'port',      width: '4.5rem'                 },
-      { id: 'uptime',   label: 'uptime',    sortable: true, width: '5rem'   },
-      { id: 'cpu',      label: 'cpu',       sortable: true, width: '4rem', align: 'right' },
-      { id: 'mem',      label: 'mem',       sortable: true, width: '5rem', align: 'right' },
-      { id: 'restarts', label: 'restarts',  sortable: true, width: '4.5rem', align: 'right' },
-      { id: 'trend',    label: 'trend',     width: '5rem'                   },
-      { id: 'group',    label: 'group',     width: '6rem'                   },
-      { id: 'actions',  label: '',          width: '8rem'                   },
-    ],
-    collect() {
-      const processes = pm2List();
-      const merges     = CONFIG.merges  || {};
-      const entries    = CONFIG.entries || {};
-      const order      = CONFIG.globalOrder || [];
-      const mergedNames = new Set(Object.values(merges).flat());
-      return processes
-        .filter(p => !mergedNames.has(p.name))
-        .map(p => {
-          const s = summarizeProcess(p);
-          const isOnline = s.status === 'online';
-          return {
-            id:           `pm2:${p.name}`,
-            type:         'pm2',
-            name:         p.name,
-            title:        s._title || null,
-            icon:         '▶',
-            status:       s.status,
-            statusBucket: toStatusBucket('pm2', s.status),
-            group:        s._group || null,
-            color:        s._color || null,
-            order:        (() => { const i = order.indexOf(p.name); return i >= 0 ? i : 9999; })(),
-            metrics: {
-              cpu:          s.cpu_percent,
-              memoryBytes:  s.memory_bytes,
-              memoryHuman:  s.memory_human,
-              uptimeMs:     s.uptime_ms,
-              uptimeHuman:  s.uptime_human,
-              restarts:     s.restarts || 0,
-            },
-            meta: {
-              port:    s.port,
-              pid:     s.pid,
-              cwd:     s.cwd,
-              script:  s.script,
-              logOut:  s.log_out,
-              logErr:  s.log_err,
-            },
-            actions: isOnline
-              ? ['restart','reload','stop','logs','detail','signal','scale']
-              : ['start','delete','logs'],
-          };
-        });
-    },
-    action(id, cmd) {
-      const name = id.replace(/^pm2:/, '');
-      const ALLOWED = ['restart','reload','stop','start','delete','flush','reset'];
-      if (!ALLOWED.includes(cmd) || !validateName(name)) return { ok: false, error: 'invalid command or name' };
-      try {
-        run(`pm2 ${cmd} ${JSON.stringify(name)}`, { timeout: 15000 });
-        invalidatePm2Cache();
-        return { ok: true };
-      } catch (e) { return { ok: false, error: e.message }; }
-    },
-    detail(id) {
-      const name = id.replace(/^pm2:/, '');
-      const p = pm2Find(name);
-      return p ? summarizeProcess(p) : null;
-    },
-    logs(id, opts = {}) {
-      const name  = id.replace(/^pm2:/, '');
-      const lines = Math.min(opts.lines || 80, 500);
-      try {
-        return run(`pm2 logs ${JSON.stringify(name)} --lines ${lines} --nostream --raw 2>&1`, { encoding: 'utf-8', timeout: 10000 });
-      } catch (e) { return String(e.message || e); }
-    },
-  },
-
-  // ── Merged virtual cards ───────────────────────────────────────────────────
-  merge: {
-    type: 'merge', icon: '⚡', label: 'merge',
-    availableActions: ['restart','logs'],
-    tableColumns: [
-      { id: 'status',  label: '',       align: 'center', width: '2rem'  },
-      { id: 'name',    label: 'name',   sortable: true                  },
-      { id: 'members', label: 'parts',  width: '8rem'                   },
-      { id: 'group',   label: 'group',  width: '6rem'                   },
-      { id: 'actions', label: '',       width: '6rem'                   },
-    ],
-    collect() {
-      const merges  = CONFIG.merges  || {};
-      const entries = CONFIG.entries || {};
-      const order   = CONFIG.globalOrder || [];
-      const allProcs = pm2List();
-      const byName  = {};
-      for (const p of allProcs) byName[p.name] = p;
-      return Object.entries(merges).map(([key, pNames]) => {
-        if (!pNames.some(n => byName[n])) return null;
-        const cfg       = entries[key] || entries[pNames[0]] || {};
-        const liveProcs = pNames.filter(n => byName[n]).map(n => summarizeProcess(byName[n]));
-        const anyOnline = liveProcs.some(p => p.status === 'online');
-        return {
-          id:           `merge:${key}`,
-          type:         'merge',
-          name:         key,
-          title:        cfg.title || key,
-          icon:         '⚡',
-          status:       anyOnline ? 'online' : 'stopped',
-          statusBucket: anyOnline ? 'active' : 'stopped',
-          group:        cfg.group || null,
-          color:        cfg.color || null,
-          order:        (() => { const i = order.indexOf(key); return i >= 0 ? i : 9999; })(),
-          metrics: {
-            cpu: null, memoryBytes: null, memoryHuman: null, uptimeMs: null, uptimeHuman: null,
-            restarts: liveProcs.reduce((s, p) => s + (p.restarts || 0), 0),
-          },
-          meta: { members: pNames },
-          actions: anyOnline ? ['restart','logs'] : ['start'],
-        };
-      }).filter(Boolean);
-    },
-    action(id, cmd) {
-      const key = id.replace(/^merge:/, '');
-      const pNames = (CONFIG.merges || {})[key] || [];
-      try {
-        if (cmd === 'restart') { for (const n of pNames) run(`pm2 restart ${JSON.stringify(n)}`, { timeout: 15000 }); }
-        else if (cmd === 'start') { for (const n of pNames) run(`pm2 start ${JSON.stringify(n)}`, { timeout: 15000 }); }
-        else return { ok: false, error: `Unknown cmd: ${cmd}` };
-        invalidatePm2Cache();
-        return { ok: true };
-      } catch (e) { return { ok: false, error: e.message }; }
-    },
-    detail(id) { return { members: (CONFIG.merges || {})[id.replace(/^merge:/, '')] || [] }; },
-    logs(id, opts = {}) {
-      const key = id.replace(/^merge:/, '');
-      const pNames = (CONFIG.merges || {})[key] || [];
-      const lines = Math.min(opts.lines || 80, 500);
-      try {
-        return pNames.map(n =>
-          run(`pm2 logs ${JSON.stringify(n)} --lines ${lines} --nostream --raw 2>&1`, { encoding: 'utf-8', timeout: 10000 })
-        ).join('\n');
-      } catch (e) { return String(e.message || e); }
-    },
-  },
-
-  // ── Static URL monitors ────────────────────────────────────────────────────
-  static: {
-    type: 'static', icon: '🔗', label: 'static',
-    availableActions: ['check-health','delete'],
-    tableColumns: [
-      { id: 'status',  label: '',         align: 'center', width: '2rem'  },
-      { id: 'name',    label: 'name',     sortable: true                  },
-      { id: 'url',     label: 'url'                                       },
-      { id: 'health',  label: 'health',   width: '5rem'                   },
-      { id: 'group',   label: 'group',    width: '6rem'                   },
-      { id: 'actions', label: '',         width: '5rem'                   },
-    ],
-    collect() {
-      const staticUrls = CONFIG.staticUrls || {};
-      const order      = CONFIG.globalOrder || [];
-      return Object.entries(staticUrls).map(([slug, u]) => ({
-        id:           `static:${slug}`,
-        type:         'static',
-        name:         slug,
-        title:        u.title || null,
-        icon:         '🔗',
-        status:       'unknown',
-        statusBucket: 'inactive',
-        group:        u.group || null,
-        color:        u.color || null,
-        order:        (() => { const i = order.indexOf(`static:${slug}`); return i >= 0 ? i : 9999; })(),
-        metrics: { cpu: null, memoryBytes: null, memoryHuman: null, uptimeMs: null, uptimeHuman: null, restarts: 0 },
-        meta: { url: u.url || null },
-        actions: ['check-health','delete'],
-      }));
-    },
-    action(id, cmd) {
-      const slug = id.replace(/^static:/, '');
-      if (cmd === 'delete') {
-        const staticUrls = CONFIG.staticUrls || {};
-        delete staticUrls[slug];
-        CONFIG.staticUrls = staticUrls;
-        saveConfig();
-        return { ok: true };
-      }
-      return { ok: false, error: `Use GET /api/static-urls/${encodeURIComponent(slug)}/health for check-health` };
-    },
-    detail(id) { return (CONFIG.staticUrls || {})[id.replace(/^static:/, '')] || null; },
-    logs() { return '(static URLs have no logs)'; },
-  },
-
-  // ── Custom daemons ─────────────────────────────────────────────────────────
-  daemon: {
-    type: 'daemon', icon: '⚙', label: 'Daemon',
-    availableActions: ['start','stop','restart','delete','logs','detail','flush-logs'],
-    tableColumns: [
-      { id: 'status',   label: '',         align: 'center', width: '2rem'  },
-      { id: 'name',     label: 'name',     sortable: true                  },
-      { id: 'pid',      label: 'pid',      width: '4rem', align: 'right'   },
-      { id: 'uptime',   label: 'uptime',   sortable: true, width: '5rem'   },
-      { id: 'cpu',      label: 'cpu',      sortable: true, width: '4rem', align: 'right' },
-      { id: 'mem',      label: 'mem',      sortable: true, width: '5rem', align: 'right' },
-      { id: 'restarts', label: 'restarts', sortable: true, width: '4.5rem', align: 'right' },
-      { id: 'group',    label: 'group',    width: '6rem'                   },
-      { id: 'actions',  label: '',         width: '7rem'                   },
-    ],
-    collect() {
-      const order = CONFIG.globalOrder || [];
-      return Object.keys(CONFIG.daemons || {}).map(key => {
-        const s = daemonManager.getSummary(key);
-        const isOnline = s.status === 'online';
-        return {
-          id:           `daemon:${key}`,
-          type:         'daemon',
-          name:         key,
-          title:        s._title || null,
-          icon:         '⚙',
-          status:       s.status,
-          statusBucket: toStatusBucket('daemon', s.status),
-          group:        s._group || null,
-          color:        s._color || null,
-          order:        (() => { const i = order.indexOf(`daemon:${key}`); return i >= 0 ? i : 9999; })(),
-          metrics: {
-            cpu:         s.cpu_percent,
-            memoryBytes: s.memory_bytes,
-            memoryHuman: s.memory_human,
-            uptimeMs:    s.uptime_ms,
-            uptimeHuman: s.uptime_human,
-            restarts:    s.restarts || 0,
-          },
-          meta: {
-            pid:     s.pid,
-            command: s.command,
-            cwd:     s.workdir,
-            logOut:  s.logFile,
-            logErr:  s.errFile,
-          },
-          actions: isOnline
-            ? ['stop','restart','logs','detail','flush-logs']
-            : ['start','delete','logs','detail'],
-        };
-      });
-    },
-    action(id, cmd) {
-      const key = id.replace(/^daemon:/, '');
-      if (!CONFIG.daemons?.[key]) return { ok: false, error: 'Daemon not found' };
-      try {
-        if (cmd === 'start')       { daemonManager.start(key); }
-        else if (cmd === 'stop')   { return Promise.resolve(daemonManager.stop(key)).then(() => ({ ok: true })); }
-        else if (cmd === 'restart') { return Promise.resolve(daemonManager.restart(key)).then(() => ({ ok: true })); }
-        else if (cmd === 'flush-logs') { daemonManager.flushLogs(key); }
-        else if (cmd === 'delete') {
-          daemonManager.stop(key).catch(() => {});
-          delete CONFIG.daemons[key];
-          saveConfig();
-        }
-        else return { ok: false, error: `Unknown cmd: ${cmd}` };
-        return { ok: true };
-      } catch (e) { return { ok: false, error: String(e) }; }
-    },
-    detail(id) {
-      const key = id.replace(/^daemon:/, '');
-      if (!CONFIG.daemons?.[key]) return null;
-      return daemonManager.getSummary(key);
-    },
-    logs(id, opts = {}) {
-      const key = id.replace(/^daemon:/, '');
-      const cfg = CONFIG.daemons?.[key];
-      if (!cfg) return '(daemon not found)';
-      const lines = Math.min(opts.lines || 80, 500);
-      const stream = opts.stream || 'out';
-      const { logFile, errFile } = daemonLogPaths(key, cfg);
-      const file = stream === 'err' ? errFile : logFile;
-      try {
-        return run(`tail -n ${lines} ${JSON.stringify(file)} 2>/dev/null || echo "(no logs yet)"`, { encoding: 'utf-8', timeout: 5000 });
-      } catch (e) { return String(e.message || e); }
-    },
-  },
-
-  // ── Cron jobs ──────────────────────────────────────────────────────────────
-  cron: {
-    type: 'cron', icon: '⏱', label: 'Cron',
-    availableActions: ['enable','disable','run-now','detail'],
-    tableColumns: [
-      { id: 'status',   label: '',          align: 'center', width: '2rem'  },
-      { id: 'name',     label: 'name / id', sortable: true                  },
-      { id: 'schedule', label: 'schedule',  width: '10rem'                  },
-      { id: 'next',     label: 'next run',  sortable: true, width: '7rem'   },
-      { id: 'command',  label: 'command'                                    },
-      { id: 'group',    label: 'group',     width: '6rem'                   },
-      { id: 'actions',  label: '',          width: '6rem'                   },
-    ],
-    collect() {
-      const order = CONFIG.globalOrder || [];
-      return parseCrontab().map(e => ({
-        id:           `cron:${e.id}`,
-        type:         'cron',
-        name:         e.id,
-        title:        e._title || null,
-        icon:         '⏱',
-        status:       e.enabled ? 'active' : 'inactive',
-        statusBucket: e.enabled ? 'active' : 'inactive',
-        group:        e._group || null,
-        color:        e._color || null,
-        order:        (() => { const i = order.indexOf(`cron:${e.id}`); return i >= 0 ? i : 9999; })(),
-        metrics: { cpu: null, memoryBytes: null, memoryHuman: null, uptimeMs: null, uptimeHuman: null, restarts: 0 },
-        meta: {
-          command:     e.command,
-          schedule:    e.humanSchedule,
-          scheduleRaw: e.schedule,
-          nextRunMs:   e.nextRunMs,
-          enabled:     e.enabled,
-        },
-        actions: ['detail', 'run-now', ...(e.enabled ? ['disable'] : ['enable'])],
-      }));
-    },
-    action(id, cmd) {
-      const cronId = id.replace(/^cron:/, '');
-      const entry = parseCrontab().find(e => e.id === cronId);
-      if (!entry) return { ok: false, error: 'Cron entry not found' };
-      try {
-        if (cmd === 'enable')   setCronEnabled(cronId, true);
-        else if (cmd === 'disable') setCronEnabled(cronId, false);
-        else if (cmd === 'run-now') {
-          const tokens = entry.command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
-          const prog = tokens[0], args = tokens.slice(1).map(t => t.replace(/^['"]|['"]$/g, ''));
-          const child = spawn(prog, args, { detached: true, stdio: 'ignore', shell: false });
-          child.unref();
-        } else return { ok: false, error: `Unknown cmd: ${cmd}` };
-        return { ok: true };
-      } catch (e) { return { ok: false, error: String(e) }; }
-    },
-    detail(id) {
-      const cronId = id.replace(/^cron:/, '');
-      return parseCrontab().find(e => e.id === cronId) || null;
-    },
-    logs() { return '(cron jobs do not have managed log files)'; },
-  },
-
-  // ── LaunchD agents (macOS) ─────────────────────────────────────────────────
-  launchd: {
-    type: 'launchd', icon: '⌘', label: 'LaunchD',
-    availableActions: ['load','unload','kickstart','stop','logs','detail'],
-    tableColumns: [
-      { id: 'status',   label: '',          align: 'center', width: '2rem'  },
-      { id: 'name',     label: 'label',     sortable: true                  },
-      { id: 'schedule', label: 'schedule',  width: '10rem'                  },
-      { id: 'pid',      label: 'pid',       width: '4rem', align: 'right'   },
-      { id: 'exit',     label: 'last exit', width: '5rem', align: 'right'   },
-      { id: 'plist',    label: 'plist',     width: '14rem'                  },
-      { id: 'group',    label: 'group',     width: '6rem'                   },
-      { id: 'actions',  label: '',          width: '7rem'                   },
-    ],
-    collect() {
-      const order = CONFIG.globalOrder || [];
-      return listLaunchAgents().map(a => {
-        const schedStr = a.schedule
-          ? (typeof a.schedule === 'string' ? a.schedule : JSON.stringify(a.schedule))
-          : null;
-        return {
-          id:           `launchd:${a.label}`,
-          type:         'launchd',
-          name:         a.label,
-          title:        a._title || null,
-          icon:         '⌘',
-          status:       a.status,
-          statusBucket: toStatusBucket('launchd', a.status),
-          group:        a._group || null,
-          color:        a._color || null,
-          order:        (() => { const i = order.indexOf(`launchd:${a.label}`); return i >= 0 ? i : 9999; })(),
-          metrics: { cpu: null, memoryBytes: null, memoryHuman: null, uptimeMs: null, uptimeHuman: null, restarts: 0 },
-          meta: {
-            pid:            a.pid,
-            command:        a.command,
-            schedule:       schedStr,
-            plistPath:      a.plistPath,
-            loaded:         a.loaded,
-            lastExitStatus: a.lastExitStatus,
-            runAtLoad:      a.runAtLoad,
-            keepAlive:      a.keepAlive,
-            logOut:         a.stdoutPath,
-            logErr:         a.stderrPath,
-          },
-          actions: a.loaded
-            ? ['stop','kickstart','logs','detail','unload']
-            : ['load','detail'],
-        };
-      });
-    },
-    action(id, cmd) {
-      const label = id.replace(/^launchd:/, '');
-      const agent = listLaunchAgents().find(a => a.label === label);
-      if (!agent) return { ok: false, error: 'Agent not found' };
-      const allowed = ['load','unload','kickstart','stop'];
-      if (!allowed.includes(cmd)) return { ok: false, error: `Unknown cmd: ${cmd}` };
-      try { doLaunchctl(cmd, agent.label, agent.plistPath); return { ok: true }; }
-      catch (e) { return { ok: false, error: String(e) }; }
-    },
-    detail(id) {
-      const label = id.replace(/^launchd:/, '');
-      invalidateLaunchdCache();
-      return listLaunchAgents().find(a => a.label === label) || null;
-    },
-    logs(id, opts = {}) {
-      const label = id.replace(/^launchd:/, '');
-      const agent = listLaunchAgents().find(a => a.label === label);
-      if (!agent) return '(agent not found)';
-      const logPath = opts.stream === 'err' ? agent.stderrPath : agent.stdoutPath;
-      if (!logPath) return '(no log path configured)';
-      try {
-        const lines = Math.min(opts.lines || 80, 500);
-        return run(`tail -n ${lines} ${JSON.stringify(logPath)} 2>/dev/null || echo "(no logs yet)"`, { encoding: 'utf-8', timeout: 5000 });
-      } catch (e) { return String(e.message || e); }
-    },
-  },
-};
 
 /**
- * Aggregate all items from every adapter into one sorted Item[].
- * Adapters are called in insertion order of ITEM_ADAPTERS.
+ * Aggregate all items from every registered adapter into one sorted Item[].
+ * Async — each adapter.list() returns Promise<Item[]> per the M4 contract.
  * A failing adapter logs an error and contributes [] — never crashes the poll.
  */
-function aggregateItems() {
-  const order = CONFIG.globalOrder || [];
+async function aggregateItems() {
   const items = [];
-  for (const adapter of Object.values(ITEM_ADAPTERS)) {
-    try {
-      items.push(...adapter.collect());
-    } catch (e) {
-      console.error(`[aggregateItems] ${adapter.type}.collect() failed:`, e.message);
-    }
-  }
+  await Promise.all(registry.list().map(async (a) => {
+    try { items.push(...await a.list()); }
+    catch (e) { console.error(`[aggregateItems] ${a.id}.list() failed:`, e.message); }
+  }));
   items.sort((a, b) => (a.order ?? 9999) - (b.order ?? 9999));
   return items;
 }
@@ -8167,54 +7738,6 @@ const API_DOCS = {
 
 // ── Request Handler ────────────────────────────────────────────────────────
 
-// ── M4 Phase 1 — legacy ITEM_ADAPTERS → contract shim ─────────────────────
-// Wraps each entry in ITEM_ADAPTERS to satisfy core/registry.cjs contract.
-// Called once at server start (skipped under PM2_MANAGE_TEST). Existing
-// per-type routes continue to serve their own traffic; shims expose the
-// same data via /api/items/:type. Phase 2+ will replace each shim with
-// a proper adapter module living in adapters/.
-function shimLegacyAdapter(legacy) {
-  const actions = {};
-  for (const cmd of legacy.availableActions || []) {
-    if (typeof legacy.action !== 'function') break;
-    actions[cmd] = {
-      params: {},
-      run: async (id) => legacy.action(id, cmd),
-    };
-  }
-  return {
-    id: legacy.type,
-    cost: 'cheap',
-    schema: () => ({
-      type: legacy.type,
-      icon: legacy.icon,
-      label: legacy.label,
-      tableColumns: legacy.tableColumns,
-    }),
-    stableId: (item) => item && item.id,
-    health: () => ({ ok: true }),
-    list: async () => (typeof legacy.collect === 'function' ? legacy.collect() : []),
-    detail: async (id) => (typeof legacy.detail === 'function' ? legacy.detail(id) : null),
-    actions,
-    // Note: legacy.logs returns a sync string, contract expects AsyncIterable.
-    // Skipping `logs` in the shim — per-type /api/{pm2,daemons,...}/:name/logs
-    // endpoints continue to serve. Phase 2+ adapters will implement properly.
-  };
-}
-
-// Types that have a real adapter under adapters/ — skipped by the legacy
-// shim loop. As Phase 2-4 progresses, add to this set; once it covers all
-// types in ITEM_ADAPTERS, the shim and ITEM_ADAPTERS itself can be deleted.
-const MIGRATED_TYPES = new Set(['launchd', 'static', 'daemon', 'cron', 'pm2', 'merge']);
-
-function registerLegacyAdapters() {
-  for (const legacy of Object.values(ITEM_ADAPTERS)) {
-    if (MIGRATED_TYPES.has(legacy.type)) continue;
-    try { registry.register(shimLegacyAdapter(legacy)); }
-    catch (e) { console.warn(`[m4] shim registration failed for ${legacy.type}: ${e.message}`); }
-  }
-}
-
 function registerRealAdapters() {
   const safe = (id, factory, deps) => {
     try { registry.register(factory(deps)); }
@@ -8933,17 +8456,22 @@ function handleRequest(req, res) {
       free_mem_human: formatMemory(freeMem),
       server_uptime_human: formatUptime(SERVER_STARTED),
     };
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    res.end(JSON.stringify({
-      html: grouped ? renderCardsGrouped(processes) : renderCards(processes),
-      count: processes.length,
-      stats,
-      metrics: metricsSnapshot(),
-      healthMetrics: healthSnapshot(),
-      processes: processes.map(summarizeProcess),
-      items: aggregateItems(),   // unified Item[] for client pipeline
-      config: CONFIG,
-    }));
+    aggregateItems().then((items) => {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({
+        html: grouped ? renderCardsGrouped(processes) : renderCards(processes),
+        count: processes.length,
+        stats,
+        metrics: metricsSnapshot(),
+        healthMetrics: healthSnapshot(),
+        processes: processes.map(summarizeProcess),
+        items,                        // unified Item[] for client pipeline
+        config: CONFIG,
+      }));
+    }).catch((err) => {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err && err.message || String(err) }));
+    });
     return;
   }
 
@@ -9041,34 +8569,9 @@ function handleRequest(req, res) {
     return;
   }
 
-  // POST /api/items/:type/:id/action — unified adapter dispatch
-  if (req.method === 'POST' && path.match(/^\/api\/items\/[^/]+\/[^/]+\/action$/)) {
-    const rest = path.slice('/api/items/'.length, -'/action'.length);
-    const slashIdx = rest.indexOf('/');
-    const type = rest.slice(0, slashIdx);
-    const id = decodeURIComponent(rest.slice(slashIdx + 1));
-    const adapter = ITEM_ADAPTERS[type];
-    if (!adapter) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: `Unknown adapter type: ${type}`, availableTypes: Object.keys(ITEM_ADAPTERS) }));
-      return;
-    }
-    parseBody(req).then(async (body) => {
-      const cmd = body.cmd;
-      try {
-        const result = await Promise.resolve(adapter.action(`${type}:${id}`, cmd));
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(result));
-      } catch (e) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: String(e) }));
-      }
-    }).catch((e) => {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: String(e) }));
-    });
-    return;
-  }
+  // POST /api/items/:type/:id/action — DELETED M4 Phase 6.
+  // Now served by handleItemsRequest at the top of this function (with
+  // backward-compat shim for the body-cmd format).
 
   // POST /api/action — DEPRECATED (410 Gone)
   if (req.method === 'POST' && path === '/api/action') {
@@ -9894,7 +9397,6 @@ if (process.env.PM2_MANAGE_TEST) {
     _readCrontabLines, setCronEnabled,
   };
 } else {
-  registerLegacyAdapters();
   registerRealAdapters();
   const server = http.createServer(handleRequest);
   server.listen(PORT, HOST, () => {
