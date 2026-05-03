@@ -2057,6 +2057,7 @@ function renderPage(processes) {
       <div class="filter-sep"></div>
       <select class="sort-select" id="sort-select" onchange="setSortOrder(this.value)" title="Sort visible cards">
         <option value="">sort…</option>
+        <option value="severity">⚠ Severity ↓</option>
         <option value="name-asc">Name A→Z</option>
         <option value="name-desc">Name Z→A</option>
         <option value="status">Status</option>

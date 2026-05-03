@@ -225,10 +225,60 @@
 
         // Tier 1 polish — surface any errored card via the sticky banner.
         updateSeverityBanner();
+        // Tier 2 polish — flag cards whose status changed since last visit.
+        _sinceYouLeft.mark();
 
         firstLoad = false;
       } catch {}
     }
+
+    // ── Since-you-left pill (Tier 2 polish) ───────────────────────────────
+    // Snapshot of {name: status} saved when the tab loses visibility or
+    // unloads. On the next page load, diff against the snapshot — cards
+    // whose state changed get a blue pill until clicked. Pills only show
+    // once per page session — runs at the FIRST patchCards/full-rebuild
+    // after load, then never again until next reload.
+    const _sinceYouLeft = (() => {
+      let initial = {};
+      try { initial = JSON.parse(localStorage.getItem('pm2-snapshot') || '{}'); } catch {}
+      const ts = Number(initial._ts) || 0;
+      delete initial._ts;
+      let _markedThisLoad = false;
+      function snapshot() {
+        const snap = { _ts: Date.now() };
+        document.querySelectorAll('.card[data-name]').forEach(c => {
+          snap[c.dataset.name] = c.dataset.status;
+        });
+        try { localStorage.setItem('pm2-snapshot', JSON.stringify(snap)); } catch {}
+      }
+      // Persist on tab-hide and on unload — "since I last actively looked"
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') snapshot();
+      });
+      window.addEventListener('beforeunload', snapshot);
+      function markChangedCards() {
+        if (_markedThisLoad || !ts) return;
+        const ageMin = Math.max(1, Math.round((Date.now() - ts) / 60000));
+        const ageStr = ageMin < 60 ? `${ageMin}m ago` : `${Math.round(ageMin / 60)}h ago`;
+        document.querySelectorAll('.card[data-name]').forEach(c => {
+          const name = c.dataset.name;
+          const prev = initial[name];
+          if (prev && prev !== c.dataset.status) {
+            // Avoid duplicate pills if patch fires multiple times before mark settles
+            if (c.querySelector('.changed-pill')) return;
+            const pill = document.createElement('button');
+            pill.className = 'changed-pill';
+            pill.title = `Status was "${prev}" when you last looked — click to dismiss`;
+            pill.textContent = `↻ changed ${ageStr}`;
+            pill.onclick = (e) => { e.stopPropagation(); pill.remove(); };
+            // Place at top-right of card
+            c.appendChild(pill);
+          }
+        });
+        _markedThisLoad = true;
+      }
+      return { mark: markChangedCards };
+    })();
 
     // Severity banner — shows when ANY card has data-status="errored".
     // Pure DOM read; idempotent on every refresh tick.
@@ -486,9 +536,55 @@
         return new Set(Array.isArray(p) ? p : [p]);
       } catch { return new Set(def); }
     }
+    // ── URL state overlay (Tier 2 polish) ─────────────────────────────────
+    // localStorage is the source of truth for "last view"; URL params add
+    // shareability and browser-back navigation. URL params override
+    // localStorage on initial load only — subsequent setter calls write
+    // both. Empty/default values are stripped from the URL to keep it clean.
+    function _readUrlParams() {
+      try { return new URLSearchParams(window.location.search); }
+      catch { return new URLSearchParams(); }
+    }
+    function _initFromUrl() {
+      const p = _readUrlParams();
+      const ifSet = (key, fn) => { if (p.has(key)) fn(p.get(key)); };
+      const arrOrAll = v => { const a = v.split(',').filter(Boolean); return a.length ? a : ['all']; };
+      ifSet('type',   v => localStorage.setItem('pm2-type-filter',   JSON.stringify(arrOrAll(v))));
+      ifSet('status', v => localStorage.setItem('pm2-status-filter', JSON.stringify(arrOrAll(v))));
+      ifSet('sort',   v => localStorage.setItem('pm2-sort-order',    v));
+      ifSet('view',   v => v && localStorage.setItem('pm2-view',     v));
+      ifSet('group',  v => localStorage.setItem('pm2-group-view',    v === '1' ? 'grouped' : 'flat'));
+    }
+    _initFromUrl(); // must run BEFORE the state vars below are read
+    // Restore search term from URL after the input element exists.
+    setTimeout(() => {
+      const p = _readUrlParams();
+      const si = document.getElementById('search-input');
+      if (p.has('q') && si) { si.value = p.get('q'); applyFilters(); }
+    }, 0);
+
     let activeTypeFilter   = _loadFilterSet('pm2-type-filter',   ['all']);
     let activeStatusFilter = _loadFilterSet('pm2-status-filter', ['all']);
     let activeSortOrder    = localStorage.getItem('pm2-sort-order') || '';
+
+    // Serialize current state to query params, defaults stripped.
+    function _writeUrlState() {
+      const p = new URLSearchParams();
+      const typeArr   = [...activeTypeFilter].filter(v => v !== 'all');
+      const statusArr = [...activeStatusFilter].filter(v => v !== 'all');
+      if (typeArr.length)   p.set('type',   typeArr.join(','));
+      if (statusArr.length) p.set('status', statusArr.join(','));
+      if (activeSortOrder)  p.set('sort',   activeSortOrder);
+      const view = localStorage.getItem('pm2-view');
+      if (view && view !== 'cards') p.set('view', view);
+      const group = localStorage.getItem('pm2-group-view');
+      if (group === 'grouped') p.set('group', '1');
+      const q = (s = p.toString()) => s ? '?' + s : '';
+      const term = document.getElementById('search-input')?.value?.trim();
+      if (term) p.set('q', term);
+      const url = window.location.pathname + q(p.toString()) + window.location.hash;
+      try { history.replaceState(null, '', url); } catch {}
+    }
 
     function _saveFilterSet(key, set) {
       localStorage.setItem(key, JSON.stringify([...set]));
@@ -512,6 +608,7 @@
       }
       _saveFilterSet('pm2-type-filter', activeTypeFilter);
       _syncTabActive('.type-tab', activeTypeFilter);
+      _writeUrlState();
       applyFilters();
     }
 
@@ -526,12 +623,14 @@
       }
       _saveFilterSet('pm2-status-filter', activeStatusFilter);
       _syncTabActive('.status-tab', activeStatusFilter);
+      _writeUrlState();
       applyFilters();
     }
 
     function setSortOrder(order) {
       activeSortOrder = order;
       localStorage.setItem('pm2-sort-order', order);
+      _writeUrlState();
       applyFilters();
     }
 
@@ -542,11 +641,40 @@
       return status || '';
     }
 
+    // Parse filter DSL: `type:cron status:errored name~api free text`.
+    // Operators: `:` exact match, `~` substring match. Unknown keys are
+    // treated as plain text. Returns { plain, tokens: [{key, op, value}] }.
+    function _parseFilterDsl(input) {
+      const tokens = [];
+      const plain = [];
+      const RE = /^([a-z]+)([:~])(.+)$/i;
+      for (const word of input.split(/\s+/).filter(Boolean)) {
+        const m = word.match(RE);
+        const KNOWN = ['type', 'status', 'name', 'id', 'tag'];
+        if (m && KNOWN.includes(m[1].toLowerCase())) {
+          tokens.push({ key: m[1].toLowerCase(), op: m[2], value: m[3].toLowerCase() });
+        } else {
+          plain.push(word.toLowerCase());
+        }
+      }
+      return { plain: plain.join(' '), tokens };
+    }
+
+    function _tagsForCard(card) {
+      const tagsMap = (typeof DASH_CONFIG !== 'undefined' && DASH_CONFIG && DASH_CONFIG.tags) || {};
+      const name = card.dataset.name;
+      // Already-prefixed names (cron:abc, launchd:com.foo) resolve directly;
+      // bare pm2 names need the prefix added.
+      return tagsMap[name] || tagsMap[`pm2:${name}`] || [];
+    }
+
     function applyFilters() {
-      const term = document.getElementById('search-input').value.trim().toLowerCase();
+      const raw = document.getElementById('search-input').value.trim();
+      const { plain, tokens } = _parseFilterDsl(raw);
 
       document.querySelectorAll('.card[data-name]').forEach((card) => {
         const name   = card.dataset.name.toLowerCase();
+        const id     = name; // dataset.name IS the id for non-pm2 types
         const type   = card.dataset.type || 'server';
         const status = _normStatus(card.dataset.status);
 
@@ -559,9 +687,24 @@
           activeStatusFilter.has('all') ||
           activeStatusFilter.has(status);
 
-        const searchMatch = !term || name.includes(term);
+        // DSL tokens — every token must match. Mixed `:` exact vs `~` substring.
+        const dslMatch = tokens.every((t) => {
+          let cardVal = '';
+          if      (t.key === 'type')   cardVal = type;
+          // Use RAW status (not normalized) for DSL — users type what they
+          // see in the badge ("scheduled", not "online" after normalization).
+          else if (t.key === 'status') cardVal = (card.dataset.status || '').toLowerCase();
+          else if (t.key === 'name')   cardVal = name;
+          else if (t.key === 'id')     cardVal = id;
+          else if (t.key === 'tag')    cardVal = _tagsForCard(card).join(' ').toLowerCase();
+          if (t.op === ':') return cardVal === t.value;
+          if (t.op === '~') return cardVal.includes(t.value);
+          return false;
+        });
 
-        card.style.display = (typeMatch && statusMatch && searchMatch) ? '' : 'none';
+        const searchMatch = !plain || name.includes(plain);
+
+        card.style.display = (typeMatch && statusMatch && dslMatch && searchMatch) ? '' : 'none';
       });
 
       // Hide group sections where all visible children are hidden
@@ -644,10 +787,37 @@
 
       const TYPE_ORDER = { server: 0, static: 1, daemon: 2, cron: 3, launchd: 4 };
       const STATUS_ORDER = { online: 0, launching: 1, stopped: 2, errored: 3 };
+      // Severity ordering: errored at top (most attention-demanding), then
+      // anything restarting frequently (flapping), then everything else,
+      // then idle/stopped at bottom. Tier 2 polish from the design review.
+      const SEVERITY_ORDER = {
+        errored: 0, launching: 1, online: 3, active: 3, scheduled: 3,
+        stopped: 5, inactive: 5,
+      };
+      const _restartsOf = (card) => {
+        const labels = card.querySelectorAll('.stat-label');
+        for (const lbl of labels) {
+          if (lbl.textContent.trim() === 'restarts') {
+            return parseInt(lbl.nextElementSibling?.textContent || '0') || 0;
+          }
+        }
+        return 0;
+      };
 
       const cards = [...grid.querySelectorAll('.card[data-name]')];
       cards.sort((a, b) => {
         switch (activeSortOrder) {
+          case 'severity': {
+            const sa = SEVERITY_ORDER[_normStatus(a.dataset.status)] ?? 4;
+            const sb = SEVERITY_ORDER[_normStatus(b.dataset.status)] ?? 4;
+            // Within the same severity bucket, "flapping" (>=3 restarts)
+            // floats up above non-flapping peers.
+            const fa = _restartsOf(a) >= 3 ? 0 : 1;
+            const fb = _restartsOf(b) >= 3 ? 0 : 1;
+            if (sa !== sb) return sa - sb;
+            if (fa !== fb) return fa - fb;
+            return a.dataset.name.localeCompare(b.dataset.name);
+          }
           case 'name-asc':  return a.dataset.name.localeCompare(b.dataset.name);
           case 'name-desc': return b.dataset.name.localeCompare(a.dataset.name);
           case 'status': {
@@ -681,6 +851,7 @@
 
     // applySearch kept as the oninput target — delegates to applyFilters
     function applySearch(q) {
+      _writeUrlState();
       applyFilters();
     }
 
@@ -714,6 +885,7 @@
     function toggleView() {
       currentView = currentView === 'cards' ? 'table' : 'cards';
       localStorage.setItem('pm2-view', currentView);
+      _writeUrlState();
       applyView();
     }
 
@@ -1973,6 +2145,7 @@
     function toggleGroupView() {
       groupView = groupView === 'flat' ? 'grouped' : 'flat';
       localStorage.setItem('pm2-group-view', groupView);
+      _writeUrlState();
       if (navbar) navbar.updateSegToggle('group-seg', groupView);
       // Fade transition on layout change
       var gridEl = document.getElementById('grid');

@@ -454,6 +454,33 @@
       transition: border-color 0.12s, box-shadow 0.12s;
     }
     .card:hover { border-color: var(--text-muted); box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
+    /* Since-you-left pill — Tier 2 polish. Tiny blue pill at the top-right
+       of any card whose status changed between the last tab-hide/unload
+       snapshot and the current page load. Click to dismiss. Disappears
+       on next reload because the snapshot updates on hide/unload. */
+    .changed-pill {
+      position: absolute;
+      top: 6px;
+      right: 6px;
+      z-index: 5;
+      background: var(--accent);
+      color: var(--bg-primary);
+      border: 0;
+      border-radius: 9px;
+      padding: 2px 7px;
+      font: inherit;
+      font-size: 0.62rem;
+      font-weight: 600;
+      cursor: pointer;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.25);
+      animation: changed-pill-in 240ms ease-out;
+    }
+    .changed-pill:hover { filter: brightness(1.15); }
+    @keyframes changed-pill-in {
+      from { opacity: 0; transform: translateY(-3px); }
+      to   { opacity: 1; transform: translateY(0);     }
+    }
+
     /* Severity banner — Tier 1 polish. Sticky red bar that surfaces ANY
        errored card to the top of the viewport, even when the offending
        card is below the fold. Hidden when no errors → conservation of
