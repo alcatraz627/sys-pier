@@ -52,6 +52,20 @@ module.exports = function createStaticAdapter(deps) {
       const u = (getConfig().staticUrls || {})[slug];
       return u ? asItem(slug, u) : null;
     },
+
+    // M5 contract v2 — 3-slot KPI strip per item.
+    kpis: (item) => {
+      const url = item?.meta?.url || '';
+      const protocol = url.startsWith('https://') ? 'https' : url.startsWith('http://') ? 'http' : url.startsWith('file://') ? 'file' : '—';
+      const host = url ? (url.replace(/^[a-z]+:\/\//, '').split('/')[0] || '—') : '—';
+      const group = item?.group || '—';
+      return [
+        { label: 'proto', value: protocol, tone: 'ok' },
+        { label: 'host',  value: host.length > 24 ? host.slice(0, 22) + '…' : host, tone: 'ok' },
+        { label: 'group', value: group, tone: 'idle' },
+      ];
+    },
+
     actions: {
       delete: {
         params: {},

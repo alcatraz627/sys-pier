@@ -2554,13 +2554,24 @@ async function handleItemsRequest(req, res, urlPath, urlObj) {
   const adapter = registry.get(type);
   if (!adapter) return json(404, { error: `unknown adapter type: ${type}` });
 
+  // M5 contract v2 — if the adapter exposes kpis(item), enrich each item
+  // in the response with .kpis. Failures per-item are non-fatal: skip kpi
+  // enrichment for that item and let the rest of the payload through.
+  const enrich = (item) => {
+    if (item && typeof adapter.kpis === 'function') {
+      try { item.kpis = adapter.kpis(item); } catch {}
+    }
+    return item;
+  };
+
   try {
     if (req.method === 'GET' && !id) {
-      return json(200, await adapter.list());
+      const items = await adapter.list();
+      return json(200, items.map(enrich));
     }
     if (req.method === 'GET' && id && !action) {
       const item = await adapter.detail(id);
-      return item == null ? json(404, { error: 'not found' }) : json(200, item);
+      return item == null ? json(404, { error: 'not found' }) : json(200, enrich(item));
     }
     if (req.method === 'POST' && id && action) {
       const def = adapter.actions[action];

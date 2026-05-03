@@ -98,3 +98,32 @@ test('optional fields are accepted', () => {
   );
   assert.equal(registry.has('demo'), true);
 });
+
+// M5 contract v2 — kpis/history/getCommands are optional fns.
+test('kpis/history/getCommands accepted as optional functions', () => {
+  registry.clear();
+  registry.register(makeValidAdapter({
+    kpis: (item) => [
+      { label: 'a', value: '1', tone: 'ok' },
+      { label: 'b', value: '2', tone: 'ok' },
+      { label: 'c', value: '3', tone: 'ok' },
+    ],
+    history: () => [1, 2, 3, 4, 5],
+    getCommands: () => [{ id: 'demo.foo', label: 'Foo', run: () => {} }],
+  }));
+  assert.equal(registry.has('demo'), true);
+  const a = registry.get('demo');
+  assert.equal(a.kpis({}).length, 3);
+  assert.deepEqual(a.history({}), [1, 2, 3, 4, 5]);
+  assert.equal(a.getCommands().length, 1);
+});
+
+test('kpis/history/getCommands reject non-function values', () => {
+  registry.clear();
+  for (const f of ['kpis', 'history', 'getCommands']) {
+    assert.throws(
+      () => registry.register(makeValidAdapter({ [f]: 'not-fn' })),
+      new RegExp(`\\.${f} must be a function or omitted`),
+    );
+  }
+});

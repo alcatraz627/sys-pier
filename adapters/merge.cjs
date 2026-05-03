@@ -92,6 +92,19 @@ module.exports = function createMergeAdapter(deps) {
       for (const p of allProcs) byName[p.name] = p;
       return asItem(key, pNames, byName);
     },
+
+    // M5 contract v2 — 3-slot KPI strip per item.
+    kpis: (item) => {
+      const members = item?.meta?.members || [];
+      const restarts = item?.metrics?.restarts || 0;
+      const isOnline = item?.status === 'online';
+      return [
+        { label: 'members',  value: String(members.length), tone: 'ok' },
+        { label: 'state',    value: isOnline ? 'online' : 'stopped', tone: isOnline ? 'ok' : 'idle' },
+        { label: 'restarts', value: String(restarts), tone: (restarts >= 3 ? 'warn' : 'ok') },
+      ];
+    },
+
     actions: {
       start:   makeMergeAction('start'),
       restart: makeMergeAction('restart', { confirm: true }),

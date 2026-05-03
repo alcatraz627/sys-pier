@@ -148,6 +148,18 @@ module.exports = function createPm2Adapter(deps) {
 
     invalidate: invalidatePm2Cache,
 
+    // M5 contract v2 — 3-slot KPI strip. tone: 'ok'|'warn'|'error'|'idle'.
+    kpis: (item) => {
+      const m = (item && item.metrics) || {};
+      const isOnline = item && item.status === 'online';
+      const restarts = m.restarts || 0;
+      return [
+        { label: 'cpu',     value: m.cpu != null ? `${m.cpu}%` : '—',  tone: (m.cpu > 80 ? 'warn' : isOnline ? 'ok' : 'idle') },
+        { label: 'mem',     value: m.memoryHuman || '—',               tone: isOnline ? 'ok' : 'idle' },
+        { label: 'restart', value: String(restarts),                    tone: (restarts >= 3 ? 'warn' : 'ok') },
+      ];
+    },
+
     logs: async function* (id, opts = {}) {
       const name = id.replace(/^pm2:/, '');
       const lines = Math.min(opts.lines || 80, 500);

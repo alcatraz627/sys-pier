@@ -124,6 +124,18 @@ module.exports = function createLaunchdAdapter(deps) {
       stop:      makeAction('stop',      { confirm: true }),
     },
 
+    // M5 contract v2 — 3-slot KPI strip per item.
+    kpis: (item) => {
+      const meta = (item && item.meta) || {};
+      const loaded = meta.loaded;
+      const lastExit = meta.lastExitStatus;
+      return [
+        { label: 'loaded', value: loaded ? 'yes' : 'no',                       tone: loaded ? 'ok' : 'idle' },
+        { label: 'pid',    value: meta.pid != null ? String(meta.pid) : '—',  tone: meta.pid ? 'ok' : 'idle' },
+        { label: 'exit',   value: lastExit == null ? '—' : String(lastExit),  tone: (lastExit && lastExit !== 0 ? 'error' : 'ok') },
+      ];
+    },
+
     // AsyncIterable<string> per contract — wraps the legacy sync tail read
     // as a single-shot generator. Phase 4+ may upgrade to true streaming
     // (tail -F via spawn).

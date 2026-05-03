@@ -69,5 +69,17 @@ module.exports = function createClaudeInstancesAdapter(deps) {
       return inst ? asItem(inst) : null;
     },
     actions: {},
+
+    // M5 contract v2 — 3-slot KPI strip per item.
+    kpis: (item) => {
+      const meta = item?.meta || {};
+      const ageMin = meta.startedAt ? Math.round((Date.now() - meta.startedAt) / 60000) : null;
+      const ageStr = ageMin == null ? '—' : ageMin < 60 ? `${ageMin}m ago` : `${Math.round(ageMin / 60)}h ago`;
+      return [
+        { label: 'pid',     value: String(meta.pid || '—'), tone: 'ok' },
+        { label: 'model',   value: meta.model || (meta.oneShot ? 'one-shot' : 'interactive'), tone: 'ok' },
+        { label: 'started', value: ageStr, tone: 'ok' },
+      ];
+    },
   };
 };

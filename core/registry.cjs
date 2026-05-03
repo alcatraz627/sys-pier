@@ -24,9 +24,14 @@
 //   subscribe     : (emit) => dispose (optional) — push updates instead of poll
 //   invalidate    : () => void (optional) — bust internal caches
 //   mutationsInvalidate : string[] (optional) — adapter ids to bust on action
+//
+// Contract v2 additions (M5, optional — adapters opt in as the UI grows):
+//   kpis(item)    : (item) => [{label, value, tone}, ×3]   — 3-slot KPI strip
+//   history(item) : (item) => number[]  (last N samples)   — universal sparkline
+//   getCommands() : () => Command[]                        — Cmd+K palette feed
 
 const REQUIRED_FIELDS = ['id', 'schema', 'stableId', 'health', 'cost', 'list', 'detail', 'actions'];
-const OPTIONAL_FIELDS = ['source', 'logs', 'subscribe', 'invalidate', 'mutationsInvalidate'];
+const OPTIONAL_FIELDS = ['source', 'logs', 'subscribe', 'invalidate', 'mutationsInvalidate', 'kpis', 'history', 'getCommands'];
 const ALL_FIELDS = new Set([...REQUIRED_FIELDS, ...OPTIONAL_FIELDS]);
 const VALID_COSTS = new Set(['cheap', 'expensive']);
 
@@ -54,7 +59,7 @@ function validate(a) {
       throw new Error(`adapter "${a.id}".actions.${name}.params must be a JSONSchema object or omitted`);
     }
   }
-  for (const f of ['source', 'logs', 'subscribe', 'invalidate']) {
+  for (const f of ['source', 'logs', 'subscribe', 'invalidate', 'kpis', 'history', 'getCommands']) {
     if (a[f] != null && typeof a[f] !== 'function') throw new Error(`adapter "${a.id}".${f} must be a function or omitted`);
   }
   if (a.mutationsInvalidate != null) {

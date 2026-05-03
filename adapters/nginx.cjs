@@ -70,6 +70,20 @@ module.exports = function createNginxAdapter(deps) {
       return b ? asItem(b) : null;
     },
     actions: {},
+
+    // M5 contract v2 — 3-slot KPI strip per item.
+    kpis: (item) => {
+      const meta = item?.meta || {};
+      const ports = meta.upstreamPorts || [];
+      const alive = (meta.upstreamsAlive || []).filter(u => u.alive).length;
+      const total = (meta.upstreamsAlive || []).length;
+      return [
+        { label: 'upstream', value: total > 0 ? `${alive}/${total}` : '—',  tone: total === 0 ? 'idle' : alive === total ? 'ok' : alive === 0 ? 'error' : 'warn' },
+        { label: 'listen',   value: (meta.listenPorts || []).join(',') || '—', tone: 'ok' },
+        { label: 'ports',    value: ports.length ? ports.slice(0, 3).join(',') : '—', tone: 'ok' },
+      ];
+    },
+
     // regen lives at POST /api/nginx/regen — preserved as a separate route.
   };
 };

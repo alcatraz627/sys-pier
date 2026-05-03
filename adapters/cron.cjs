@@ -65,6 +65,26 @@ module.exports = function createCronAdapter(deps) {
       const e = findEntry(id);
       return e ? asItem(e) : null;
     },
+
+    // M5 contract v2 — 3-slot KPI strip per item.
+    kpis: (item) => {
+      const meta = (item && item.meta) || {};
+      const enabled = meta.enabled;
+      const nextMs = meta.nextRunMs;
+      const inText = nextMs ? (() => {
+        const ms = nextMs - Date.now();
+        if (ms < 0) return 'past due';
+        if (ms < 60000) return `in ${Math.round(ms / 1000)}s`;
+        if (ms < 3600000) return `in ${Math.round(ms / 60000)}m`;
+        return `in ${Math.round(ms / 3600000)}h`;
+      })() : '—';
+      return [
+        { label: 'enabled',  value: enabled ? 'yes' : 'no',                     tone: enabled ? 'ok' : 'idle' },
+        { label: 'schedule', value: meta.schedule || '—',                       tone: 'ok' },
+        { label: 'next',     value: inText,                                     tone: enabled ? 'ok' : 'idle' },
+      ];
+    },
+
     actions: {
       enable: {
         params: {},

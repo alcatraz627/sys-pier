@@ -78,6 +78,19 @@ module.exports = function createDaemonAdapter(deps) {
       if (!getConfig().daemons?.[key]) return null;
       return asItem(key, daemonManager.getSummary(key));
     },
+
+    // M5 contract v2 — 3-slot KPI strip per item.
+    kpis: (item) => {
+      const m = (item && item.metrics) || {};
+      const isOnline = item && item.status === 'online';
+      const restarts = m.restarts || 0;
+      return [
+        { label: 'cpu',     value: m.cpu != null ? `${m.cpu}%` : '—',  tone: (m.cpu > 80 ? 'warn' : isOnline ? 'ok' : 'idle') },
+        { label: 'mem',     value: m.memoryHuman || '—',               tone: isOnline ? 'ok' : 'idle' },
+        { label: 'restart', value: String(restarts),                    tone: (restarts >= 3 ? 'warn' : 'ok') },
+      ];
+    },
+
     actions: {
       start: {
         params: {},

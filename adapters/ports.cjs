@@ -91,6 +91,18 @@ module.exports = function createPortsAdapter(deps) {
       const l = result.listeners?.find((x) => x.port === port);
       return l ? asItem(l) : null;
     },
+
+    // M5 contract v2 — 3-slot KPI strip per item.
+    kpis: (item) => {
+      const meta = item?.meta || {};
+      const kind = meta.kind || 'unknown';
+      return [
+        { label: 'pid',     value: meta.pid != null ? String(meta.pid) : '—', tone: 'ok' },
+        { label: 'kind',    value: kind, tone: kind === 'orphan' ? 'error' : kind === 'pm2' ? 'ok' : 'idle' },
+        { label: 'command', value: (meta.command || '—').slice(0, 16), tone: 'ok' },
+      ];
+    },
+
     actions: {
       ignore: {
         params: {},
