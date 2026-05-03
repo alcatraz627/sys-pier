@@ -9,7 +9,7 @@
     "pm2:stop": "pm2 delete sys-pier-backend 2>/dev/null; true",
     "pm2:restart": "pm2 restart sys-pier-backend",
     "pm2:logs": "pm2 logs sys-pier-backend",
-    "test:unit": "SYS_PIER_TEST=1 PM2_MANAGE_TEST=1 node --test --test-force-exit tests/unit.test.mjs tests/registry.test.mjs",
+    "test:unit": "SYS_PIER_TEST=1 PM2_MANAGE_TEST=1 node --test --test-force-exit tests/unit.test.mjs tests/registry.test.mjs tests/tags.test.mjs",
     "test:api": "node --test --test-force-exit tests/api.test.mjs",
     "test:ui": "npx playwright test tests/ui.spec.mjs --config playwright.config.mjs",
     "test": "npm run test:unit && npm run test:api && npm run test:ui"

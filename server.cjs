@@ -26,6 +26,7 @@ const os = require('os');
 const fs = require('fs');
 const portScanner = require('./port-scanner.cjs');
 const registry = require('./core/registry.cjs');
+const createTagsService = require('./core/tags.cjs');
 
 // Guarantee full PATH for all shell commands — pm2 LaunchAgent runs with a stripped PATH
 // that may omit /opt/homebrew/bin (pm2, brew tools) and even /usr/bin (id, crontab).
@@ -303,6 +304,13 @@ function saveConfig() {
 }
 
 let CONFIG = loadConfig();
+
+// Tags service — Phase 5 — closures over CONFIG + saveConfig so adapters
+// can require this through deps without poking CONFIG.tags directly.
+const tagsService = createTagsService({
+  getConfig: () => CONFIG,
+  saveConfig,
+});
 
 // Persist migration if it happened (any version bump)
 try { saveConfig(); } catch {}
@@ -2867,7 +2875,7 @@ function handleRequest(req, res) {
   // DELETE /api/tags/:type/:key            → clear
   if (req.method === 'GET' && path === '/api/tags') {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    res.end(JSON.stringify({ tags: CONFIG.tags || {} }));
+    res.end(JSON.stringify({ tags: tagsService.getAll() }));
     return;
   }
   {
@@ -2875,21 +2883,17 @@ function handleRequest(req, res) {
     if (m) {
       const type = decodeURIComponent(m[1]);
       const key = decodeURIComponent(m[2]);
-      const sk = stableKey(type, key);
-      if (!CONFIG.tags) CONFIG.tags = {};
+      const sk = tagsService.stableKey(type, key);
       if (req.method === 'GET') {
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ type, key, stableKey: sk, tags: CONFIG.tags[sk] || [] }));
+        res.end(JSON.stringify({ type, key, stableKey: sk, tags: tagsService.getTagsFor(type, key) }));
         return;
       }
       if (req.method === 'PUT') {
         parseBody(req).then((body) => {
-          const tags = Array.isArray(body.tags) ? body.tags.map(String).map(t => t.trim()).filter(Boolean) : [];
-          if (tags.length === 0) delete CONFIG.tags[sk];
-          else CONFIG.tags[sk] = [...new Set(tags)];
-          saveConfig();
+          const tags = tagsService.setTagsFor(type, key, body.tags || []);
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({ ok: true, stableKey: sk, tags: CONFIG.tags[sk] || [] }));
+          res.end(JSON.stringify({ ok: true, stableKey: sk, tags }));
         }).catch((err) => {
           res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ error: err.message }));
@@ -2897,8 +2901,7 @@ function handleRequest(req, res) {
         return;
       }
       if (req.method === 'DELETE') {
-        delete CONFIG.tags[sk];
-        saveConfig();
+        tagsService.clearTagsFor(type, key);
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ ok: true, stableKey: sk }));
         return;
