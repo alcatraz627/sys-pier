@@ -2485,6 +2485,25 @@ function registerRealAdapters() {
     getConfig: () => CONFIG,
     run,
   });
+
+  // ports — wraps port-scanner.cjs. Listening TCP sockets as items;
+  // status reflects pm2/system/orphan/ignored classification.
+  safe('ports', require('./adapters/ports.cjs'), {
+    portScanner,
+    getConfig: () => CONFIG,
+    saveConfig,
+    pm2List,
+  });
+
+  // claude-instances — pgrep-backed enumerator of live Claude CLI sessions.
+  safe('claude-instances', require('./adapters/claude-instances.cjs'), {
+    scanClaudeInstances,
+  });
+
+  // nginx — local nginx server-block parser + upstream alive cross-check.
+  safe('nginx', require('./adapters/nginx.cjs'), {
+    scanNginx,
+  });
 }
 
 // ── M4 Phase 1 — generic adapter request handler ──────────────────────────
