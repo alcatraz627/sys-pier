@@ -2067,6 +2067,16 @@ function renderPage(processes) {
     </div>
   </div>
 
+  <!-- Severity banner — Tier 1 polish, post-M4 design review.
+       Hidden by default; updateSeverityBanner() in dashboard.js shows it
+       when any card is errored. Sticky to viewport top so it survives
+       scroll past the offending card. -->
+  <div id="severity-banner" class="severity-banner" hidden>
+    <span class="severity-banner-icon" aria-hidden="true">⚠</span>
+    <span class="severity-banner-text"></span>
+    <button type="button" class="severity-banner-jump">Jump →</button>
+  </div>
+
   <div class="grid" id="grid">
     ${cards}
   </div>

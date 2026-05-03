@@ -223,8 +223,41 @@
         // Re-apply all active filters (type, status, search, sort)
         applyFilters();
 
+        // Tier 1 polish — surface any errored card via the sticky banner.
+        updateSeverityBanner();
+
         firstLoad = false;
       } catch {}
+    }
+
+    // Severity banner — shows when ANY card has data-status="errored".
+    // Pure DOM read; idempotent on every refresh tick.
+    function updateSeverityBanner() {
+      const banner = document.getElementById('severity-banner');
+      if (!banner) return;
+      const errored = [...document.querySelectorAll('.card[data-status="errored"]')];
+      if (!errored.length) {
+        if (!banner.hidden) {
+          banner.hidden = true;
+          // Strip the slide-in animation so next appearance retriggers it cleanly.
+          banner.style.animation = 'none';
+          requestAnimationFrame(() => { banner.style.animation = ''; });
+        }
+        return;
+      }
+      const names = errored.map(c => c.dataset.name).slice(0, 3);
+      const more = errored.length > 3 ? ` and ${errored.length - 3} more` : '';
+      const wasHidden = banner.hidden;
+      banner.querySelector('.severity-banner-text').textContent =
+        `${errored.length} errored: ${names.join(', ')}${more}`;
+      banner.querySelector('.severity-banner-jump').onclick = () =>
+        errored[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+      banner.hidden = false;
+      // If we're transitioning from hidden→visible, the CSS animation runs
+      // automatically. If it was already visible (just text update), don't
+      // re-trigger the slide.
+      if (!wasHidden) banner.style.animation = 'none';
+      else            banner.style.animation = '';
     }
 
     // Patch existing card DOM elements in-place using process data,

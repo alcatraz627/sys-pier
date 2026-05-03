@@ -454,11 +454,66 @@
       transition: border-color 0.12s, box-shadow 0.12s;
     }
     .card:hover { border-color: var(--text-muted); box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
-    .card[data-status="online"]  { border-left-color: var(--green); }
-    .card[data-status="stopped"] { border-left-color: var(--text-faint); opacity: 0.72; }
-    .card[data-status="stopped"]:hover { opacity: 1; }
-    .card[data-status="errored"] { border-left-color: var(--danger); box-shadow: 0 0 0 1px var(--danger-bg); }
+    /* Severity banner — Tier 1 polish. Sticky red bar that surfaces ANY
+       errored card to the top of the viewport, even when the offending
+       card is below the fold. Hidden when no errors → conservation of
+       attention (Krug): the loudest UI element should fire least often. */
+    .severity-banner {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: var(--danger);
+      color: #fff;
+      padding: 7px 12px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      border-radius: var(--radius-sm);
+      margin-bottom: 8px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+      animation: severity-banner-in 200ms ease-out;
+    }
+    .severity-banner[hidden] { display: none; }
+    .severity-banner-icon { font-size: 1rem; line-height: 1; }
+    .severity-banner-text { flex: 1; }
+    .severity-banner-jump {
+      background: rgba(255,255,255,0.2);
+      border: 1px solid rgba(255,255,255,0.4);
+      color: #fff;
+      padding: 3px 10px;
+      border-radius: 3px;
+      cursor: pointer;
+      font: inherit;
+      transition: background 100ms ease-out;
+    }
+    .severity-banner-jump:hover { background: rgba(255,255,255,0.32); }
+    @keyframes severity-banner-in {
+      from { transform: translateY(-100%); opacity: 0; }
+      to   { transform: translateY(0);     opacity: 1; }
+    }
+
+    /* Status-driven left rail (Tier 1 polish, post-M4 design review) ──────
+       Pre-attentive color signal across the whole card grid: green=running,
+       red=errored, accent=scheduled-but-not-yet-fired, faint=stopped/idle.
+       Stopped + inactive cards fade to 0.55 opacity to reduce visual weight;
+       hover restores so they're still interactive. */
+    .card[data-status="online"]    { border-left-color: var(--green); }
+    .card[data-status="errored"]   { border-left-color: var(--danger); box-shadow: 0 0 0 1px var(--danger-bg); }
     .card[data-status="launching"] { border-left-color: var(--warning); }
+    .card[data-status="scheduled"] { border-left-color: var(--accent); }
+    .card[data-status="active"]    { border-left-color: var(--green); }
+    .card[data-status="stopped"],
+    .card[data-status="inactive"] {
+      border-left-color: var(--text-faint);
+      opacity: 0.55;
+      transition: opacity 120ms ease-out;
+    }
+    .card[data-status="stopped"]:hover,
+    .card[data-status="inactive"]:hover,
+    .card[data-status="stopped"]:focus-within,
+    .card[data-status="inactive"]:focus-within { opacity: 1; }
 
     /* Card entry animation — only for genuinely new cards (JS-managed) */
     .card-enter {
