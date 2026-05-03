@@ -1305,6 +1305,29 @@
       setTimeout(probe, 1500); // give the old process time to actually exit
     }
 
+    // Generic action handler — for adapters rendered via the M5 generic
+    // kpi-driven card. Posts to /api/items/:type/:id/:action and refreshes.
+    async function doGenericAction(type, id, action, btn) {
+      const label = btn?.textContent?.trim();
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = `<span class="btn-spinner"></span> ${action}`;
+      }
+      try {
+        const res = await fetch('/api/items/' + encodeURIComponent(type) + '/' + encodeURIComponent(id) + '/' + encodeURIComponent(action), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}',
+        });
+        const data = await res.json();
+        toast(data.ok ? `${action} ${id} ✓` : 'Error: ' + (data.error || '?'), data.ok ? 'ok' : 'err');
+        if (data.ok) setTimeout(refresh, 800);
+      } catch { toast('Request failed', 'err'); }
+      finally {
+        if (btn) { btn.disabled = false; btn.textContent = label; }
+      }
+    }
+
     function confirmDelete(name) {
       if (confirm('Delete "' + name + '"?\n\nThis removes it from pm2 entirely. You will need to re-run its ecosystem file to add it back.')) {
         doAction('delete', name, null);

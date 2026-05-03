@@ -454,6 +454,51 @@
       transition: border-color 0.12s, box-shadow 0.12s;
     }
     .card:hover { border-color: var(--text-muted); box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
+    /* Generic kpi-strip — M5 Phase 1. 3-slot row driven by adapter.kpis(item).
+       Each kpi has a `data-tone` of ok/warn/error/idle that maps to color.
+       Used for adapter types without a hand-rolled card (ports, nginx,
+       claude-instances); future migration target for typed cards too. */
+    .kpi-strip {
+      display: flex;
+      gap: 6px;
+      padding: 6px 0 4px;
+      width: 100%;
+    }
+    .kpi {
+      flex: 1 1 0;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 1px;
+      padding: 4px 6px;
+      background: var(--bg-tertiary, var(--bg-secondary));
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      min-width: 0;
+    }
+    .kpi-label {
+      font-size: 0.55rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--text-faint);
+      line-height: 1.1;
+    }
+    .kpi-val {
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: var(--text-primary);
+      line-height: 1.2;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .kpi[data-tone="warn"]  .kpi-val { color: var(--warning, #d29922); }
+    .kpi[data-tone="error"] .kpi-val { color: var(--danger);   }
+    .kpi[data-tone="idle"]  .kpi-val { color: var(--text-muted); }
+    .kpi[data-tone="warn"]  { border-color: var(--warning, #d29922); }
+    .kpi[data-tone="error"] { border-color: var(--danger); }
+
     /* Since-you-left pill — Tier 2 polish. Tiny blue pill at the top-right
        of any card whose status changed between the last tab-hide/unload
        snapshot and the current page load. Click to dismiss. Disappears

@@ -1717,6 +1717,45 @@ function renderMergedCard(mergeKey, entries, processByName) {
 </div>`;
 }
 
+// Generic kpi-driven card renderer for adapters that don't have a
+// type-specific renderer (ports, nginx, claude-instances). Uses
+// item.kpis (3-slot strip) instead of hand-rolled stat rows. Identical
+// outer shell to typed cards so rails / opacity / banner all apply.
+function renderGenericKpiCard(item) {
+  const kpis = Array.isArray(item.kpis) ? item.kpis : [];
+  const badge = item.status || 'unknown';
+  const dotClass = item.statusBucket === 'active' ? 'online' : item.statusBucket === 'errored' ? 'errored' : 'stopped';
+  const kpiHtml = kpis.map(k =>
+    `<div class="kpi" data-tone="${escHtml(k.tone || 'ok')}">
+      <span class="kpi-label">${escHtml(k.label || '')}</span>
+      <span class="kpi-val">${escHtml(String(k.value ?? '—'))}</span>
+    </div>`
+  ).join('');
+
+  const actions = (item.actions || [])
+    .filter(a => a !== 'detail')
+    .slice(0, 3)
+    .map(action =>
+      `<button class="btn btn-sm action-btn" onclick="doGenericAction('${escHtml(item.type)}','${escHtml(item.id)}','${escHtml(action)}',this)" title="${escHtml(action)}">${escHtml(action)}</button>`
+    ).join(' ');
+
+  return `<div class="card card-enter" data-status="${escHtml(item.status || 'unknown')}" data-name="${escHtml(item.id)}" data-type="${escHtml(item.type)}">
+  <div class="card-header">
+    <div class="name-row">
+      <span class="status-dot ${dotClass}" title="${escHtml(badge)}"></span>
+      <span class="proc-icon">${escHtml(item.icon || '·')}</span>
+      <span class="proc-name" title="${escHtml(item.id)}">${escHtml(item.title || item.name || item.id)}</span>
+      <span class="type-badge type-badge--${escHtml(item.type)}" title="${escHtml(item.type)}">${escHtml(item.type)}</span>
+    </div>
+    <span class="badge ${dotClass}">${escHtml(badge)}</span>
+  </div>
+  <div class="card-body">
+    <div class="kpi-strip">${kpiHtml}</div>
+  </div>
+  ${actions ? `<div class="card-actions">${actions}<button class="btn btn-sm" onclick="openItemDetail('${escHtml(item.type)}','${escHtml(item.id)}')" title="Detail">ⓘ</button></div>` : ''}
+</div>`;
+}
+
 function renderCards(processes) {
   const sorted = sortedProcesses(processes);
   const staticUrls = CONFIG.staticUrls || {};
@@ -1940,7 +1979,16 @@ function toStatusBucket(type, rawStatus) {
 async function aggregateItems() {
   const items = [];
   await Promise.all(registry.list().map(async (a) => {
-    try { items.push(...await a.list()); }
+    try {
+      const list = await a.list();
+      // Enrich with kpis (M5 contract v2). Per-item failures non-fatal.
+      if (typeof a.kpis === 'function') {
+        for (const item of list) {
+          try { item.kpis = a.kpis(item); } catch {}
+        }
+      }
+      items.push(...list);
+    }
     catch (e) { console.error(`[aggregateItems] ${a.id}.list() failed:`, e.message); }
   }));
   items.sort((a, b) => (a.order ?? 9999) - (b.order ?? 9999));
@@ -3229,9 +3277,15 @@ function handleRequest(req, res) {
       server_uptime_human: formatUptime(SERVER_STARTED),
     };
     aggregateItems().then((items) => {
+      // Types without a hand-rolled renderCard function — render via the
+      // generic kpi-driven path (uses adapter.kpis()). Append to whatever
+      // the typed renderers produce.
+      const UNRENDERED = new Set(['ports', 'claude-instances', 'nginx']);
+      const extras = items.filter(it => UNRENDERED.has(it.type)).map(renderGenericKpiCard).join('\n');
+      const baseHtml = grouped ? renderCardsGrouped(processes) : renderCards(processes);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({
-        html: grouped ? renderCardsGrouped(processes) : renderCards(processes),
+        html: baseHtml + (extras ? '\n' + extras : ''),
         count: processes.length,
         stats,
         metrics: metricsSnapshot(),
