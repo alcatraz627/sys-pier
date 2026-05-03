@@ -4,6 +4,13 @@
 > Purpose: every `${...}` inside `renderPage()` (server.cjs L2388-L8147)
 > classified by what should happen to it during Phase 3 (static frontend
 > extract). Source data: `tools/classify-interpolations.cjs`.
+>
+> **Status (2026-05-03):** Phase 3a + 3b both shipped. The 5 JS-context
+> sites listed below now read from `window.__SYS_PIER__`; the 138
+> escaped browser-side sites moved into `public/dashboard.js` via the
+> file extract. The line numbers below reference pre-Phase-3 server.cjs
+> and are no longer valid against the current file. Re-run
+> `node tools/classify-interpolations.cjs server.cjs` to refresh.
 
 ## Headline numbers
 

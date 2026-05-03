@@ -1,5 +1,18 @@
 # M4 — Adapter Refactor Plan (synthesized 2026-05-01)
 
+> **Status (2026-05-03):** EXECUTED. All phases complete, with two
+> explicit deviations from the plan:
+> 1. **Full `core/config.cjs` migration skipped** in Phase 5 — the CONFIG
+>    global has 100+ refs across `server.cjs`; tags-only service ships
+>    the meaningful payoff without the structural risk.
+> 2. **`server.cjs` 1200-1500 line target not met** — currently ~4130
+>    lines. The remaining bulk is `renderPage()` HTML body + handlers,
+>    which would require splitting `renderPage` itself (out of plan
+>    scope, no clear payoff).
+>
+> See [`m4-summary.md`](./m4-summary.md) for the post-execution writeup
+> and [`adapters.md`](./adapters.md) for the contract reference.
+
 > Plan synthesized from author draft + 2 parallel Opus reviewer agents
 > (general-purpose). Reviewers pushed back on phase ordering, contract
 > shape, "thin core" target, and migration sequence. This is the version
