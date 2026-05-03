@@ -2660,6 +2660,23 @@ function handleRequest(req, res) {
     return;
   }
 
+  // POST /api/self/restart — explicit self-restart for the dashboard.
+  // Bypasses the NO_SELF_MANAGE guard by design (it's the whole point of
+  // this endpoint). Pattern: flush {ok:true} response BEFORE exiting so
+  // the browser knows the request was received; pm2's autorestart picks
+  // up the exit (restart_delay: 2000 in ecosystem.config.cjs).
+  //
+  // Why not pm2 restart sys-pier-backend? That spawns a child that asks
+  // pm2 daemon to restart us — but if our request handler hasn't returned
+  // yet, the response is lost. process.exit(0) on a delay is simpler and
+  // gives pm2 a clean signal it can react to via autorestart.
+  if (req.method === 'POST' && path === '/api/self/restart') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ ok: true, message: 'restarting in ~100ms — pm2 autorestart will bring it back' }));
+    setTimeout(() => process.exit(0), 100);
+    return;
+  }
+
   if (req.method === 'GET' && path === '/api/info') {
     let pm2Version = 'unknown';
     try { pm2Version = run('pm2 --version', { encoding: 'utf-8', timeout: 3000 }).trim(); } catch {}

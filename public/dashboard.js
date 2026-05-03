@@ -1076,6 +1076,30 @@
       }
     }
 
+    // Restart sys-pier-backend itself. Hits a dedicated endpoint that
+    // bypasses the NO_SELF_MANAGE guard by design — the server flushes
+    // {ok:true} first, then process.exit(0)s on a short delay so the
+    // response actually reaches the browser. pm2's autorestart picks it
+    // back up (restart_delay: 2000 in ecosystem.config.cjs).
+    async function doSelfRestart() {
+      if (!confirm('Restart the sys-pier dashboard backend?\n\nThis will briefly disconnect (~3-5s). The page will auto-reload when it is back.')) return;
+      toast('Restarting dashboard… page will auto-reload', 'ok');
+      try {
+        await fetch('/api/self/restart', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      } catch { /* server already shutting down — expected */ }
+      // Poll /api/info until the new instance answers, then hard-reload.
+      const start = Date.now();
+      const probe = async () => {
+        if (Date.now() - start > 30000) { toast('Restart timed out — check pm2 logs', 'err'); return; }
+        try {
+          const r = await fetch('/api/info', { cache: 'no-store' });
+          if (r.ok) { location.reload(); return; }
+        } catch {}
+        setTimeout(probe, 500);
+      };
+      setTimeout(probe, 1500); // give the old process time to actually exit
+    }
+
     function confirmDelete(name) {
       if (confirm('Delete "' + name + '"?\n\nThis removes it from pm2 entirely. You will need to re-run its ecosystem file to add it back.')) {
         doAction('delete', name, null);
@@ -1853,6 +1877,10 @@
           key: '?', hint: 'help',
           title: 'Quick reference (?)',
           className: 'help', group: 'settings', action: () => openHelp() },
+        { id: 'self-restart-btn', label: '',
+          icon: '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" style="vertical-align:-2px"><path d="M2 8a6 6 0 0110.5-4M14 8a6 6 0 01-10.5 4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" fill="none"/><path d="M11 2v3h3M5 14v-3H2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>',
+          title: 'Restart sys-pier-backend (~3s downtime)',
+          group: 'settings', action: () => doSelfRestart() },
         { id: 'theme-btn', label: '',
           icon: '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" style="vertical-align:-2px"><circle cx="8" cy="8" r="3" fill="currentColor"/><path d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M3.1 3.1l1.1 1.1M11.8 11.8l1.1 1.1M3.1 12.9l1.1-1.1M11.8 4.2l1.1-1.1" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>',
           key: 't', noMod: true, hint: 'theme',
