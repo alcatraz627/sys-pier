@@ -2525,13 +2525,9 @@ async function handleItemsRequest(req, res, urlPath, urlObj) {
       return item == null ? json(404, { error: 'not found' }) : json(200, item);
     }
     if (req.method === 'POST' && id && action) {
-      // Backward-compat: dashboard JS POSTs to /api/items/:type/:id/action
-      // with body {cmd: '<name>'}. Translate to the new shape so the legacy
-      // UI keeps working until the inline <script> is rewritten in Phase 3b.
+      const def = adapter.actions[action];
+      if (!def) return json(404, { error: `unknown action: ${action}` });
       const body = await readJsonBody(req);
-      const actionName = (action === 'action' && body && body.cmd) ? body.cmd : action;
-      const def = adapter.actions[actionName];
-      if (!def) return json(404, { error: `unknown action: ${actionName}` });
       const result = await def.run(id, body || {});
       // Cross-adapter cache busting per contract
       if (Array.isArray(adapter.mutationsInvalidate)) {

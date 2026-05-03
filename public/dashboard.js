@@ -1062,10 +1062,10 @@
         btn.innerHTML = `<span class="btn-spinner"></span> ${cmd}`;
       }
       try {
-        const res = await fetch('/api/items/pm2/' + encodeURIComponent(name) + '/action', {
+        const res = await fetch('/api/items/pm2/' + encodeURIComponent(name) + '/' + encodeURIComponent(cmd), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ cmd }),
+          body: '{}',
         });
         const data = await res.json();
         toast(data.ok ? cmd + ' ' + name + ' ✓' : 'Error: ' + (data.error || '?'), data.ok ? 'ok' : 'err');
@@ -1948,7 +1948,7 @@
     async function doGroupAction(cmd, gid) {
       try {
         const entries = Object.entries(DASH_CONFIG.entries || {}).filter(([,v]) => v.group === gid).map(([k]) => k);
-        for (const name of entries) { await fetch('/api/items/pm2/' + encodeURIComponent(name) + '/action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cmd }) }); }
+        for (const name of entries) { await fetch('/api/items/pm2/' + encodeURIComponent(name) + '/' + encodeURIComponent(cmd), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); }
         const gname = (DASH_CONFIG.groups[gid] || {}).name || gid;
         toast(cmd + ' all in ' + gname + ' ✓', 'ok');
         setTimeout(refresh, 800);
