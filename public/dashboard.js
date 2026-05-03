@@ -1305,6 +1305,149 @@
       setTimeout(probe, 1500); // give the old process time to actually exit
     }
 
+    // ── Command palette (M5 #4) ───────────────────────────────────────────
+    // Cmd+K (Ctrl+K) opens a fuzzy-search modal listing every (entity, verb)
+    // pair across all 9 adapters. Built from the dashboard's existing
+    // allItems array — zero server fetches at open time. ↑↓ navigate, ↵ run,
+    // Esc close. Items dim subtly on hover; selected entry has accent bg.
+    const _cmdk = {
+      entries: [],
+      filtered: [],
+      selectedIdx: 0,
+      open() {
+        this.rebuild();
+        const backdrop = document.getElementById('cmdk-backdrop');
+        if (!backdrop) return;
+        backdrop.hidden = false;
+        const input = document.getElementById('cmdk-input');
+        input.value = '';
+        this.selectedIdx = 0;
+        this.render();
+        // focus after the show animation can pick it up
+        requestAnimationFrame(() => input.focus());
+      },
+      close() {
+        const backdrop = document.getElementById('cmdk-backdrop');
+        if (backdrop) backdrop.hidden = true;
+      },
+      // Build the list of {verb, entity, type, id, action, confirm} entries
+      // from allItems. Each item exposes its own actions[] array.
+      rebuild() {
+        const list = [];
+        const items = (typeof allItems !== 'undefined' && allItems) ? allItems : [];
+        for (const it of items) {
+          const actions = Array.isArray(it.actions) ? it.actions : [];
+          for (const a of actions) {
+            if (a === 'detail' || a === 'logs') continue; // skip non-mutations
+            list.push({
+              verb: a,
+              entity: it.name || it.id,
+              type: it.type,
+              id: it.id,
+              action: a,
+              // Heuristic: confirm for known destructive verbs
+              confirm: ['stop','delete','unload','disable','restart','reload','kill'].includes(a),
+            });
+          }
+        }
+        // Sort: stable order by type then name then verb
+        list.sort((a, b) => (a.type + a.entity + a.verb).localeCompare(b.type + b.entity + b.verb));
+        this.entries = list;
+      },
+      filter(q) {
+        const term = q.toLowerCase().trim();
+        if (!term) { this.filtered = this.entries.slice(0, 100); return; }
+        // Simple subsequence fuzzy match: every char of term appears in order
+        // somewhere in `<verb> <entity> <type>`. Fast for <500 entries.
+        const matches = [];
+        for (const e of this.entries) {
+          const hay = (e.verb + ' ' + e.entity + ' ' + e.type).toLowerCase();
+          let ti = 0;
+          for (let i = 0; i < hay.length && ti < term.length; i++) {
+            if (hay[i] === term[ti]) ti++;
+          }
+          if (ti === term.length) matches.push(e);
+        }
+        this.filtered = matches.slice(0, 100);
+      },
+      render() {
+        const ul = document.getElementById('cmdk-list');
+        if (!ul) return;
+        if (!this.filtered.length) {
+          ul.innerHTML = '<li class="cmdk-empty">No matching commands</li>';
+          return;
+        }
+        const html = this.filtered.map((e, i) =>
+          `<li class="cmdk-item${i === this.selectedIdx ? ' cmdk-selected' : ''}" data-idx="${i}">
+            <span class="cmdk-verb">${escHtmlClient(e.verb)}</span>
+            <span class="cmdk-entity">${escHtmlClient(e.entity)}</span>
+            <span class="cmdk-type">${escHtmlClient(e.type)}</span>
+            ${e.confirm ? '<span class="cmdk-confirm" title="confirm before running">!</span>' : ''}
+          </li>`
+        ).join('');
+        ul.innerHTML = html;
+      },
+      move(delta) {
+        if (!this.filtered.length) return;
+        this.selectedIdx = (this.selectedIdx + delta + this.filtered.length) % this.filtered.length;
+        this.render();
+        const el = document.querySelector('.cmdk-item.cmdk-selected');
+        if (el) el.scrollIntoView({ block: 'nearest' });
+      },
+      async execute() {
+        const e = this.filtered[this.selectedIdx];
+        if (!e) return;
+        if (e.confirm && !confirm(`${e.verb} ${e.entity}?`)) return;
+        this.close();
+        try {
+          const res = await fetch(
+            '/api/items/' + encodeURIComponent(e.type) + '/' + encodeURIComponent(e.id) + '/' + encodeURIComponent(e.action),
+            { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }
+          );
+          const data = await res.json();
+          toast(data.ok ? `${e.verb} ${e.entity} ✓` : 'Error: ' + (data.error || '?'), data.ok ? 'ok' : 'err');
+          if (data.ok) setTimeout(refresh, 800);
+        } catch { toast('Request failed', 'err'); }
+      },
+    };
+    // Tiny HTML escape — re-uses _esc but kept aliased for clarity inside cmdk.
+    function escHtmlClient(s) { return _esc(String(s == null ? '' : s)); }
+
+    // Wire keyboard: open, navigate, execute, close
+    document.addEventListener('keydown', (ev) => {
+      const isMac = navigator.platform.includes('Mac');
+      const opener = isMac ? (ev.metaKey && ev.key.toLowerCase() === 'k') : (ev.ctrlKey && ev.key.toLowerCase() === 'k');
+      if (opener && !ev.shiftKey && !ev.altKey) {
+        ev.preventDefault();
+        _cmdk.open();
+        return;
+      }
+      const backdrop = document.getElementById('cmdk-backdrop');
+      if (!backdrop || backdrop.hidden) return;
+      if (ev.key === 'Escape')      { ev.preventDefault(); _cmdk.close(); }
+      else if (ev.key === 'ArrowDown') { ev.preventDefault(); _cmdk.move(1); }
+      else if (ev.key === 'ArrowUp')   { ev.preventDefault(); _cmdk.move(-1); }
+      else if (ev.key === 'Enter')     { ev.preventDefault(); _cmdk.execute(); }
+    });
+    // Wire input filtering
+    requestAnimationFrame(() => {
+      const input = document.getElementById('cmdk-input');
+      if (input) input.addEventListener('input', () => {
+        _cmdk.filter(input.value);
+        _cmdk.selectedIdx = 0;
+        _cmdk.render();
+      });
+      const ul = document.getElementById('cmdk-list');
+      if (ul) ul.addEventListener('click', (ev) => {
+        const li = ev.target.closest('.cmdk-item');
+        if (!li) return;
+        _cmdk.selectedIdx = parseInt(li.dataset.idx, 10) || 0;
+        _cmdk.execute();
+      });
+    });
+    function cmdkClose() { _cmdk.close(); } // exposed for backdrop click handler
+    // ───────────────────────────────────────────────────────────────────────
+
     // Generic action handler — for adapters rendered via the M5 generic
     // kpi-driven card. Posts to /api/items/:type/:id/:action and refreshes.
     async function doGenericAction(type, id, action, btn) {

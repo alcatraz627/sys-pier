@@ -2441,6 +2441,18 @@ function renderPage(processes) {
 
   <div class="hint-bar" id="hint-bar"></div>
 
+  <!-- Command palette — M5 contract v2 #4. Triggered by Cmd+K (Mac) or
+       Ctrl+K. Lists every {entity, verb} pair across all adapters, fuzzy-
+       filtered. Linear/Raycast pattern: entity+verb together in one line. -->
+  <div id="cmdk-backdrop" class="cmdk-backdrop" hidden onclick="if (event.target === this) cmdkClose()">
+    <div class="cmdk-modal" role="dialog" aria-label="Command palette">
+      <input type="text" id="cmdk-input" class="cmdk-input"
+             placeholder="Type a command — e.g. restart sys-pier-backend, disable cron, tag..." autocomplete="off">
+      <div class="cmdk-hint">↑↓ navigate · ↵ run · esc close</div>
+      <ul id="cmdk-list" class="cmdk-list" role="listbox"></ul>
+    </div>
+  </div>
+
   <script>window.__SYS_PIER__ = ${JSON.stringify(bootstrap)};</script>
   <script src="/dashboard.js"></script>
 </body>
