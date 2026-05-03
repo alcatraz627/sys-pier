@@ -504,7 +504,11 @@ function recordDaemonMetrics() {
   }
 }
 
-setInterval(() => { try { recordMetrics(pm2List()); recordDaemonMetrics(); } catch {} }, 5000);
+// Skip background timers under PM2_MANAGE_TEST so unit tests can let the
+// process exit naturally instead of relying on --test-force-exit.
+if (!process.env.PM2_MANAGE_TEST) {
+  setInterval(() => { try { recordMetrics(pm2List()); recordDaemonMetrics(); } catch {} }, 5000);
+}
 
 // ── Cache warmers ───────────────────────────────────────────────────────────
 // listLaunchAgents() is the worst offender on cold cache: 13 plist files × 2
@@ -513,11 +517,13 @@ setInterval(() => { try { recordMetrics(pm2List()); recordDaemonMetrics(); } cat
 // always hit the warm path. Cost: ~5 subprocess calls/sec sustained, ~1% CPU.
 // pm2List + _readCrontabLines warmed once at boot; _readCrontabLines's TTL
 // is 3s and it's invoked from item-pipeline polls, so it self-warms.
-setImmediate(() => {
-  try { pm2List(); } catch {}
-  try { _readCrontabLines(); } catch {}
-  try { listLaunchAgents(); } catch {}
-});
+if (!process.env.PM2_MANAGE_TEST) {
+  setImmediate(() => {
+    try { pm2List(); } catch {}
+    try { _readCrontabLines(); } catch {}
+    try { listLaunchAgents(); } catch {}
+  });
+}
 // Re-spawnable warmer. Self-reschedules each tick reading the current intensity,
 // so flipping the dropdown changes cadence on the next firing. setImmediate
 // defers the initial schedule to after module load completes — INTENSITY_PROFILES
@@ -531,9 +537,11 @@ function rescheduleLaunchdWarmer() {
   if (_launchdWarmerTimer) clearTimeout(_launchdWarmerTimer);
   _launchdWarmerTimer = setTimeout(_launchdWarmerTick, currentIntensityProfile().launchd_warm);
 }
-setImmediate(() => {
-  _launchdWarmerTimer = setTimeout(_launchdWarmerTick, currentIntensityProfile().launchd_warm);
-});
+if (!process.env.PM2_MANAGE_TEST) {
+  setImmediate(() => {
+    _launchdWarmerTimer = setTimeout(_launchdWarmerTick, currentIntensityProfile().launchd_warm);
+  });
+}
 
 // ── Static URL health history ─────────────────────────────────────────────
 // Rolling 20-sample window (~10 min at 30s intervals) of latency + status per URL.
@@ -566,9 +574,11 @@ function healthSnapshot() {
   return out;
 }
 
-setInterval(() => { recordHealthChecks().catch(() => {}); }, 30000);
-// Initial check after 2s to populate history on startup
-setTimeout(() => { recordHealthChecks().catch(() => {}); }, 2000);
+if (!process.env.PM2_MANAGE_TEST) {
+  setInterval(() => { recordHealthChecks().catch(() => {}); }, 30000);
+  // Initial check after 2s to populate history on startup
+  setTimeout(() => { recordHealthChecks().catch(() => {}); }, 2000);
+}
 
 // ── Security ───────────────────────────────────────────────────────────────
 // Binding to 127.0.0.1 is the primary guard. This is a defense-in-depth
