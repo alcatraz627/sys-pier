@@ -6,7 +6,7 @@
 // the simple action() shape (returns latency data, not just ok/error).
 
 module.exports = function createStaticAdapter(deps) {
-  const { getConfig, saveConfig } = deps;
+  const { getConfig, saveConfig, healthHistory } = deps;
 
   function asItem(slug, u) {
     const cfg = getConfig();
@@ -51,6 +51,14 @@ module.exports = function createStaticAdapter(deps) {
       const slug = id.replace(/^static:/, '');
       const u = (getConfig().staticUrls || {})[slug];
       return u ? asItem(slug, u) : null;
+    },
+
+    // M5 contract v2 — health latency history per slug.
+    history: (item) => {
+      if (!healthHistory) return [];
+      const slug = (item?.id || '').replace(/^static:/, '');
+      const h = healthHistory.get(slug);
+      return h && Array.isArray(h.latency) ? [...h.latency] : [];
     },
 
     // M5 contract v2 — 3-slot KPI strip per item.

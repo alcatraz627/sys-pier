@@ -1981,10 +1981,13 @@ async function aggregateItems() {
   await Promise.all(registry.list().map(async (a) => {
     try {
       const list = await a.list();
-      // Enrich with kpis (M5 contract v2). Per-item failures non-fatal.
-      if (typeof a.kpis === 'function') {
+      // Enrich with kpis + history (M5 contract v2). Per-item failures non-fatal.
+      const hasKpis = typeof a.kpis === 'function';
+      const hasHistory = typeof a.history === 'function';
+      if (hasKpis || hasHistory) {
         for (const item of list) {
-          try { item.kpis = a.kpis(item); } catch {}
+          if (hasKpis)    { try { item.kpis = a.kpis(item); } catch {} }
+          if (hasHistory) { try { item.history = a.history(item); } catch {} }
         }
       }
       items.push(...list);
@@ -2520,6 +2523,7 @@ function registerRealAdapters() {
   safe('static', require('./adapters/static.cjs'), {
     getConfig: () => CONFIG,
     saveConfig,
+    healthHistory, // M5 history(item) — latency rolling window per slug
   });
 
   // daemon — Phase 4 batch. Wraps daemonManager.
@@ -2530,6 +2534,7 @@ function registerRealAdapters() {
     getConfig: () => CONFIG,
     saveConfig,
     run,
+    metricsHistory, // M5 history(item) — cpu rolling window per daemon:<key>
   });
 
   // cron — Phase 4 batch. Crontab parser + detached spawn for run-now.
@@ -2551,6 +2556,7 @@ function registerRealAdapters() {
     validateName,
     getConfig: () => CONFIG,
     run,
+    metricsHistory, // M5 history(item) — cpu rolling window per pm2 name
   });
 
   // merge — Virtual cards aggregating pm2 entries. Migrate alongside pm2
@@ -2612,12 +2618,16 @@ async function handleItemsRequest(req, res, urlPath, urlObj) {
   const adapter = registry.get(type);
   if (!adapter) return json(404, { error: `unknown adapter type: ${type}` });
 
-  // M5 contract v2 — if the adapter exposes kpis(item), enrich each item
-  // in the response with .kpis. Failures per-item are non-fatal: skip kpi
-  // enrichment for that item and let the rest of the payload through.
+  // M5 contract v2 — if the adapter exposes kpis(item) or history(item),
+  // enrich each item with .kpis and .history. Failures per-item are
+  // non-fatal: skip enrichment for that item and let the rest pass.
   const enrich = (item) => {
-    if (item && typeof adapter.kpis === 'function') {
+    if (!item) return item;
+    if (typeof adapter.kpis === 'function') {
       try { item.kpis = adapter.kpis(item); } catch {}
+    }
+    if (typeof adapter.history === 'function') {
+      try { item.history = adapter.history(item); } catch {}
     }
     return item;
   };

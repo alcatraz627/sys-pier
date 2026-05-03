@@ -30,6 +30,7 @@ module.exports = function createPm2Adapter(deps) {
     validateName,
     getConfig,
     run,
+    metricsHistory, // M5 — Map<name, {cpu:[], mem:[], ts:[]}> for sparkline
   } = deps;
 
   function asItem(p) {
@@ -147,6 +148,14 @@ module.exports = function createPm2Adapter(deps) {
     mutationsInvalidate: ['ports', 'claude-instances', 'merge'],
 
     invalidate: invalidatePm2Cache,
+
+    // M5 contract v2 — rolling cpu history. Returns last N samples for the
+    // universal sparkline. Empty array if no samples yet.
+    history: (item) => {
+      if (!metricsHistory) return [];
+      const m = metricsHistory.get(item?.name);
+      return m && Array.isArray(m.cpu) ? [...m.cpu] : [];
+    },
 
     // M5 contract v2 — 3-slot KPI strip. tone: 'ok'|'warn'|'error'|'idle'.
     kpis: (item) => {

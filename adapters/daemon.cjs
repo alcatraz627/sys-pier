@@ -12,6 +12,7 @@ module.exports = function createDaemonAdapter(deps) {
     getConfig,
     saveConfig,
     run, // execSync wrapper for tail
+    metricsHistory, // M5 — same Map as pm2; daemons are keyed as `daemon:<key>`
   } = deps;
 
   function asItem(key, s) {
@@ -89,6 +90,14 @@ module.exports = function createDaemonAdapter(deps) {
         { label: 'mem',     value: m.memoryHuman || '—',               tone: isOnline ? 'ok' : 'idle' },
         { label: 'restart', value: String(restarts),                    tone: (restarts >= 3 ? 'warn' : 'ok') },
       ];
+    },
+
+    // M5 contract v2 — daemon cpu history (shares the metricsHistory Map
+    // with pm2). Daemon ids are already prefixed `daemon:<key>`.
+    history: (item) => {
+      if (!metricsHistory) return [];
+      const m = metricsHistory.get(item?.id);
+      return m && Array.isArray(m.cpu) ? [...m.cpu] : [];
     },
 
     actions: {
