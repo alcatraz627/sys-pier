@@ -11,7 +11,8 @@ const path = require('node:path');
 const { after, before, test } = require('node:test');
 const { foldLedger, mergeServices, portInCommand, startPlan } = require('./services.cjs');
 
-const noFiles = { exists: () => true, hasDevScript: () => false };
+const noFiles = { exists: () => true, devScript: () => '' };
+const withScript = (script) => ({ exists: () => true, devScript: () => script });
 const merge = (rows, ledgerText = '', extra = {}) => mergeServices({
   rows, ledger: foldLedger(ledgerText), listening: new Set(), policy: {}, fs: noFiles, ...extra,
 });
@@ -43,6 +44,64 @@ test('a ledger record pm2 already runs is not listed twice, by name or by port',
   assert.equal(byName.length, 1);
   const byPort = merge([pm2Row({ name: 'session-hub', known_ports: [5400] })], event({ name: 'claude-instances-hub', port: 5400 }));
   assert.equal(byPort.length, 1);
+  const sameNameOtherPort = merge([pm2Row({ known_ports: [7000], ports: [7000] })], event({ name: 'a', port: 6000 }));
+  assert.equal(sameNameOtherPort.length, 1);
+});
+
+test('a ledger row with fields of the wrong type cannot take down the list', () => {
+  const ledger = [
+    event({ name: 'n1', port: 6000, cwd: 123 }),
+    event({ name: 'n2', port: 6001, cwd: { a: 1 }, cmd: 7, note: [] }),
+    event({ name: 42, port: 6002 }),
+    event({ name: 'n3', port: '6003', cwd: '/x', cmd: 'go' }),
+    event({ name: 'n4', port: 'nonsense' }),
+  ].join('\n');
+  const list = merge([], ledger);
+  assert.deepEqual(list.map((s) => s.name).sort(), ['n1', 'n2', 'n3', 'n4']);
+  assert.equal(list.find((s) => s.name === 'n1').cannotStart, 'No folder on record');
+  assert.equal(list.find((s) => s.name === 'n3').port, 6003);
+  assert.equal(list.find((s) => s.name === 'n4').port, null);
+});
+
+test('a port given as a string still matches the pm2 service on it', () => {
+  assert.equal(merge([pm2Row()], event({ name: 'alias', port: '5100' })).length, 1);
+});
+
+test('a new claim on another port drops the old command, which named the old port', () => {
+  const ledger = [
+    event({ name: 'x', port: 6000, cmd: 'PORT=6000 npm start', cwd: '/x' }),
+    event({ name: 'x', port: 6100, cwd: '/x' }),
+  ].join('\n');
+  assert.equal(foldLedger(ledger).get('x').cmd, '');
+  const samePort = [event({ name: 'y', port: 6000, cmd: 'go', cwd: '/x' }), event({ name: 'y', port: 6000 })].join('\n');
+  assert.equal(foldLedger(samePort).get('y').cmd, 'go');
+});
+
+test('pm2 states in between are not read as stopped', () => {
+  const [s] = merge([pm2Row({ status: 'launching', ports: [] })]);
+  assert.equal(s.changing, true);
+  assert.equal(s.running, false);
+});
+
+test('only a socket in the service itself counts as listening, not a remembered port', () => {
+  assert.equal(merge([pm2Row({ ports: [], known_ports: [5100] })])[0].listening, false);
+  assert.equal(merge([pm2Row()])[0].listening, true);
+});
+
+test('the hub\'s own limit reason is not shown as a note about the service', () => {
+  const [s] = merge([pm2Row({ why: 'set from the service hub' })], event({ name: 'a', port: 5100, note: 'a real note' }));
+  assert.equal(s.note, 'a real note');
+  assert.equal(merge([pm2Row({ why: 'serves pages' })])[0].note, 'serves pages');
+});
+
+test('a dev script that picks its own port or app gets no guess', () => {
+  const entry = { cwd: '/x', port: 6200 };
+  for (const script of ['next dev --port=3003', 'pnpm --filter app dev', 'vite -p 80', 'PORT=1 node s.js', 'turbo run dev']) {
+    const plan = startPlan(entry, withScript(script));
+    assert.equal(plan.cmd, null, script);
+    assert.match(plan.reason, /picks its own/, script);
+  }
+  assert.equal(startPlan(entry, withScript('vite')).guessed, true);
 });
 
 test('pinned ports are the owner\'s own apps and never appear', () => {
@@ -52,7 +111,7 @@ test('pinned ports are the owner\'s own apps and never appear', () => {
 
 test('an older service can start from its recorded command, or its dev script, or says why not', () => {
   assert.equal(startPlan({ cwd: '/x', cmd: 'npm start' }, noFiles).cmd, 'npm start');
-  const guess = startPlan({ cwd: '/x', port: 6200 }, { exists: () => true, hasDevScript: () => true });
+  const guess = startPlan({ cwd: '/x', port: 6200 }, withScript('vite'));
   assert.equal(guess.cmd, 'PORT=6200 npm run dev -- --port 6200');
   assert.equal(guess.guessed, true);
   assert.equal(startPlan({ cwd: '/gone', cmd: 'x' }, { exists: () => false }).cmd, null);
@@ -65,6 +124,8 @@ test('the port comes from the recorded command when the two disagree', () => {
   assert.equal(portInCommand('npm run dev -- --port 6200 --strictPort'), 6200);
   assert.equal(portInCommand('PORT=6201 npm run dev'), 6201);
   assert.equal(portInCommand('python3 serve.py'), null);
+  assert.equal(portInCommand('serve -p 6202'), 6202);
+  assert.equal(portInCommand('grep -p 80 file'), null);
   const [s] = merge([], event({ name: 'old', port: 6300, cmd: 'PORT=6201 npm run dev', cwd: '/x' }));
   assert.equal(s.port, 6201);
 });
@@ -78,6 +139,7 @@ test('a damaged ledger line does not hide the rest', () => {
 
 const PORT = 39127;
 const TAKEN_PORT = 39132;
+const LATE_PORT = 39137;
 const blocker = net.createServer();
 const base = `http://127.0.0.1:${PORT}`;
 const origin = { Origin: base, 'Content-Type': 'application/json' };
@@ -100,8 +162,13 @@ before(async () => {
     pm2Row({ name: 'online-app', ports: [39128], known_ports: [39128] }),
     pm2Row({ name: 'stopped-app', status: 'stopped', ports: [], known_ports: [39129] }),
     pm2Row({ name: 'service-hub', ports: [PORT], known_ports: [PORT], idle_limit_min: null }),
+    pm2Row({ name: 'web app', ports: [39133], known_ports: [39133] }),
+    pm2Row({ name: 'no-port-app', ports: [], known_ports: [], verdict: 'no-port(skip)' }),
+    pm2Row({ name: 'remembered-only', status: 'stopped', ports: [], known_ports: [39134] }),
+    pm2Row({ name: 'launching-app', status: 'launching', ports: [], known_ports: [39135] }),
   ]);
   fakeTool(path.join(dir, 'svc.sh'), `
+export -p | sed 's/^declare -x //' > "${path.join(dir, 'tool-env.txt')}"
 case "$1" in
   status) echo '${rows}' ;;
   up) [ "$2" = "stopped-app" ] && { echo "svc: refused to start" >&2; exit 1; } ;;
@@ -114,10 +181,13 @@ exit 0`);
     event({ name: 'old-startable', port: 39130, cmd: 'PORT=39130 npm run dev', cwd: workdir }),
     event({ name: 'old-gone', port: 39131, cmd: 'npm start', cwd: path.join(dir, 'missing') }),
     event({ name: 'old-occupied', port: TAKEN_PORT, cmd: `PORT=${TAKEN_PORT} npm start`, cwd: workdir }),
+    event({ name: 'old-double', port: 39136, cmd: 'PORT=39136 npm run dev', cwd: workdir }),
+    event({ name: 'old-late', port: LATE_PORT, cmd: `PORT=${LATE_PORT} npm start`, cwd: workdir }),
   ].join('\n'));
   await new Promise((resolve) => blocker.listen(TAKEN_PORT, '127.0.0.1', resolve));
   child = spawn('node', [path.join(__dirname, 'server.cjs')], {
     env: {
+      SECRET_TOKEN: 'must-not-reach-tools', pm_id: '7',
       PATH: process.env.PATH, HOME: dir, HUB_PORT: String(PORT), HUB_SVC: path.join(dir, 'svc.sh'), HUB_PM2: path.join(dir, 'pm2'),
       HUB_LEDGER: path.join(dir, 'ledger.jsonl'), HUB_POLICY: path.join(dir, 'policy.json'), HUB_TAB_REPORT: path.join(dir, 'none'), HUB_START_WAIT_MS: '1500',
     },
@@ -210,10 +280,108 @@ test('bad limits and bad names are refused before anything runs', async () => {
   }
   assert.equal((await post('/api/limit', { name: 'online-app', mode: 'nonsense' })).status, 400);
   assert.equal((await post('/api/limit', { name: 'service-hub', mode: 'idle', minutes: 5 })).status, 409);
-  assert.equal((await post('/api/stop', { name: '$(touch /tmp/x)' })).status, 400);
+  assert.equal((await post('/api/stop', { name: '$(touch /tmp/x)' })).status, 404);
   assert.equal((await post('/api/stop', { name: 'no-such' })).status, 404);
+  assert.equal((await post('/api/stop', { name: 42 })).status, 400);
   assert.equal((await post('/api/up', {})).status, 400);
   assert.equal(calls().replace(before, '').includes('policy'), false);
+});
+
+test('an older service cannot be stopped or given a limit, because pm2 does not run it', async () => {
+  const before = calls();
+  assert.equal((await post('/api/stop', { name: 'old-gone' })).status, 409);
+  assert.equal((await post('/api/limit', { name: 'old-gone', mode: 'idle', minutes: 5 })).status, 409);
+  const since = calls().replace(before, '');
+  assert.doesNotMatch(since, /down|policy/);
+});
+
+test('a name pm2 allows but with a space still works', async () => {
+  assert.equal((await post('/api/stop', { name: 'web app' })).status, 200);
+  assert.match(calls(), /svc\.sh down web app/);
+});
+
+test('a service running without a port says so at once, rather than waiting', async () => {
+  const started = Date.now();
+  const res = await post('/api/up', { name: 'no-port-app' });
+  const body = await res.json();
+  assert.equal(body.ok, false);
+  assert.match(body.error, /no page to open/);
+  assert.ok(Date.now() - started < 1400, 'answered before the start wait ran out');
+});
+
+test('a remembered port with nothing of its own listening gives no address', async () => {
+  const body = await (await post('/api/up', { name: 'remembered-only' })).json();
+  assert.equal(body.url, null);
+  assert.equal(body.ok, false);
+});
+
+test('a service still launching is waited for, not reported as stopped', async () => {
+  const res = await post('/api/up', { name: 'launching-app' });
+  const body = await res.json();
+  assert.equal(res.status, 200);
+  assert.doesNotMatch(body.error || '', /stopped right after/);
+});
+
+test('two starts at once share one, so a double click shows no error', async () => {
+  const [a, b] = await Promise.all([post('/api/up', { name: 'old-double' }), post('/api/up', { name: 'old-double' })]);
+  assert.equal(a.status, b.status);
+  const launches = calls().split('\n').filter((l) => l.includes('--name old-double'));
+  assert.equal(launches.length, 1);
+});
+
+test('starting an older service saves pm2\'s list so it survives a restart', async () => {
+  await post('/api/up', { name: 'old-startable' });
+  assert.match(calls(), /pm2 save/);
+});
+
+test('a port taken after the list was read still stops the start', async () => {
+  await fetch(`${base}/api/services`);
+  const late = net.createServer();
+  await new Promise((resolve) => late.listen(LATE_PORT, '127.0.0.1', resolve));
+  try {
+    const res = await post('/api/up', { name: 'old-late' });
+    if (res.status === 200) {
+      assert.match((await res.json()).note, /outside pm2/, 'the list had refreshed, which is also safe');
+    } else {
+      assert.equal(res.status, 409);
+      assert.match((await res.json()).error, /already in use/);
+    }
+    assert.doesNotMatch(calls(), /--name old-late/);
+  } finally {
+    await new Promise((resolve) => late.close(resolve));
+  }
+});
+
+test('tools get a short environment, without tokens or pm2\'s own variables', () => {
+  const seen = fs.readFileSync(path.join(dir, 'tool-env.txt'), 'utf8');
+  assert.doesNotMatch(seen, /SECRET_TOKEN/);
+  assert.doesNotMatch(seen, /pm_id/);
+  assert.match(seen, /^PATH=/m);
+});
+
+test('the hub cannot be reached from another address on this machine', async () => {
+  const outside = Object.values(os.networkInterfaces()).flat().find((i) => i.family === 'IPv4' && !i.internal);
+  if (!outside) return;
+  await assert.rejects(fetch(`http://${outside.address}:${PORT}/api/services`));
+});
+
+test('an oversized body gets a plain refusal and the hub keeps serving', async () => {
+  const res = await post('/api/up', { name: 'x'.repeat(20000) });
+  assert.equal(res.status, 413);
+  assert.equal((await fetch(`${base}/api/services`)).status, 200);
+});
+
+test('a body that is not an object is refused plainly, with no internals', async () => {
+  for (const body of ['null', '[1]', '"x"']) {
+    const res = await fetch(`${base}/api/up`, { method: 'POST', headers: origin, body });
+    assert.equal(res.status, 400, body);
+    assert.doesNotMatch((await res.json()).error, /Cannot read|undefined/);
+  }
+});
+
+test('a content type that only starts like JSON is refused', async () => {
+  const res = await rawPost('/api/stop', { name: 'online-app' }, { Origin: base, 'Content-Type': 'application/jsonp' });
+  assert.equal(res.status, 403);
 });
 
 test('an older service is started by pm2 with its recorded command, without a shell in between', async () => {

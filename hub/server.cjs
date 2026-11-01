@@ -8,7 +8,7 @@ const fs = require('node:fs');
 const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
-const { foldLedger, mergeServices, startPlan, portInCommand } = require('./services.cjs');
+const { HUB_REASON, foldLedger, mergeServices, startPlan, portInCommand } = require('./services.cjs');
 
 const home = os.homedir();
 const CONFIG = {
@@ -26,6 +26,7 @@ const CONFIG = {
 const PAGE = path.join(__dirname, 'index.html');
 const MAX_LIMIT_MIN = 7 * 24 * 60;
 const STATUS_TTL_MS = 3000;
+const MAX_BODY = 10000;
 
 // Children get a short, named environment. Under pm2 this process carries pm2's
 // own variables, and a nested `pm2 start` would copy them into the new app.
@@ -47,6 +48,10 @@ function run(bin, args, timeout = 45000) {
 
 const svc = (...args) => run('bash', [CONFIG.svc, ...args]);
 
+// svc up may wait 30 seconds and sample pm2 on every loop. Killing it early would
+// report a failed start for a service that did in fact start.
+const svcUp = (name) => run('bash', [CONFIG.svc, 'up', name], 90000);
+
 function readJson(file) {
   try {
     return JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -65,7 +70,10 @@ function readText(file) {
 
 const projectFiles = {
   exists: (p) => fs.existsSync(p),
-  hasDevScript: (cwd) => Boolean(readJson(path.join(cwd, 'package.json')).scripts?.dev),
+  devScript: (cwd) => {
+    const script = readJson(path.join(cwd, 'package.json')).scripts?.dev;
+    return typeof script === 'string' ? script : '';
+  },
 };
 
 async function listeningPorts() {
@@ -139,7 +147,9 @@ class Refused extends Error {
 }
 
 async function findService(name) {
-  if (typeof name !== 'string' || !/^[\w.@-]+$/.test(name)) throw new Refused(400, 'That is not a service name');
+  // A name only ever matches an existing entry and reaches tools as one argument, so
+  // pm2's looser naming (spaces included) needs no pattern here.
+  if (typeof name !== 'string' || !name) throw new Refused(400, 'That is not a service name');
   const found = (await status()).services.find((s) => s.name === name);
   if (!found) throw new Refused(404, `There is no service called ${name}`);
   return found;
@@ -149,8 +159,10 @@ async function waitForPort(name) {
   const deadline = Date.now() + CONFIG.startWaitMs;
   for (;;) {
     const row = (await status({ fresh: true })).services.find((s) => s.name === name);
-    if (row && row.kind === 'pm2' && !row.running) return { row, stopped: true };
-    if (row && row.running && !row.noPort && row.port && (await listeningPorts()).has(row.port)) return { row };
+    if (row && row.kind === 'pm2' && !row.running && !row.changing) return { row, stopped: true };
+    // listening means a socket inside this service's own process tree, so another
+    // program on the same port is never mistaken for it.
+    if (row && row.listening) return { row };
     if (Date.now() > deadline) return { row, timedOut: true };
     await new Promise((r) => setTimeout(r, 1000));
   }
@@ -173,24 +185,34 @@ async function adopt(entry) {
   await run(CONFIG.pm2, ['save']);
 }
 
-async function startService(name) {
+async function startNow(name) {
   const found = await findService(name);
   if (found.kind === 'past') {
-    if (found.outsidePm2) return { ok: true, url: urlFor(found.port), note: `${name} is already running outside pm2, so it will not auto-stop` };
+    if (found.outsidePm2) return { ok: true, url: urlFor(found.port), note: `Something outside pm2 already holds port ${found.port}. It may be ${name}, and it will not auto-stop.` };
     await adopt(found);
   } else {
-    const r = await svc('up', name);
+    const r = await svcUp(name);
     if (!r.ok) throw new Refused(502, firstLine(r.stderr, `${name} did not start`));
     await svc('touch', name);
-    if (found.running && found.port) {
-      cached = null;
-      return { ok: true, url: urlFor(found.port) };
-    }
+    cached = null;
+    const now = (await status()).services.find((s) => s.name === name);
+    if (now?.listening) return { ok: true, url: urlFor(now.port) };
+    if (found.running && !found.listening) return { ok: false, url: null, error: `${name} is running, but it has no page to open` };
   }
   const { row, stopped, timedOut } = await waitForPort(name);
   if (stopped) throw new Refused(502, `${name} stopped right after starting. See: pm2 logs ${name}`);
   if (timedOut) return { ok: false, url: null, error: `${name} started, but nothing is listening yet. See: pm2 logs ${name}` };
   return { ok: true, url: urlFor(row.port) };
+}
+
+// A double click, or two tabs on the same /go address, share one start.
+const starting = new Map();
+
+function startService(name) {
+  if (starting.has(name)) return starting.get(name);
+  const start = startNow(name).finally(() => starting.delete(name));
+  starting.set(name, start);
+  return start;
 }
 
 function refuseSelf(name) {
@@ -213,12 +235,12 @@ async function setLimit(name, mode, minutes) {
   if (found.kind !== 'pm2') throw new Refused(409, `${name} is not run by pm2 yet, so it has no idle limit`);
   let args;
   if (mode === 'default') args = [name, 'default'];
-  else if (mode === 'keep') args = [name, 'keep', 'set from the service hub'];
+  else if (mode === 'keep') args = [name, 'keep', HUB_REASON];
   else if (mode === 'idle') {
     if (!Number.isInteger(minutes) || minutes < 1 || minutes > MAX_LIMIT_MIN) {
       throw new Refused(400, `The limit must be a whole number of minutes, from 1 to ${MAX_LIMIT_MIN}`);
     }
-    args = [name, 'idle', String(minutes), 'set from the service hub'];
+    args = [name, 'idle', String(minutes), HUB_REASON];
   } else throw new Refused(400, 'Unknown limit');
   const r = await svc('policy', ...args);
   if (!r.ok) throw new Refused(502, firstLine(r.stderr, 'svc refused that limit'));
@@ -238,26 +260,28 @@ function refusal(req) {
   if (req.method !== 'POST') return null;
   const origin = req.headers.origin;
   if (!origin || !allowedHosts().has(origin.replace(/^http:\/\//, ''))) return 'Wrong origin';
-  if (!(req.headers['content-type'] || '').startsWith('application/json')) return 'Expected JSON';
+  if ((req.headers['content-type'] || '').split(';')[0].trim() !== 'application/json') return 'Expected JSON';
   return null;
 }
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
+    let tooBig = false;
     req.on('data', (chunk) => {
-      body += chunk;
-      if (body.length > 10000) {
-        reject(new Refused(413, 'Too much data'));
-        req.destroy();
-      }
+      if (body.length + chunk.length > MAX_BODY) tooBig = true;
+      else body += chunk;
     });
     req.on('end', () => {
+      if (tooBig) return reject(new Refused(413, 'Too much data'));
+      let parsed;
       try {
-        resolve(JSON.parse(body || '{}'));
+        parsed = JSON.parse(body || '{}');
       } catch {
-        reject(new Refused(400, 'That was not valid JSON'));
+        return reject(new Refused(400, 'That was not valid JSON'));
       }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return reject(new Refused(400, 'Expected an object'));
+      resolve(parsed);
     });
     req.on('error', reject);
   });
@@ -296,7 +320,7 @@ const server = http.createServer((req, res) => {
   handle(req, res).catch((err) => {
     const known = err instanceof Refused;
     if (!known) console.error(err);
-    send(res, known ? err.code : 500, { ok: false, error: err.message || 'Something went wrong' });
+    send(res, known ? err.code : 500, { ok: false, error: known ? err.message : 'Something went wrong in the hub. See: pm2 logs service-hub' });
   });
 });
 

@@ -6,6 +6,10 @@
 const main = document.querySelector('.kit-page');
 const POLL_MS = 5000;
 const LIMITS = [5, 15, 30, 60, 120, 240, 480, 720, 1440];
+const TAB_REPORT_STALE_MIN = 10;
+const REAP_EVERY_MIN = 5;
+const SUCCESS_SHOWN_MS = 15000;
+const MENU_HOLD_MS = 20000;
 
 let data = null;
 let query = '';
@@ -13,6 +17,7 @@ let pastOpen = false;
 let stuckOpen = false;
 let customFor = null;
 let message = null;
+let menuFocusedAt = 0;
 
 function h(tag, attrs = {}, ...kids) {
   const el = document.createElement(tag);
@@ -50,35 +55,46 @@ async function post(path, body) {
   return answer;
 }
 
-function say(text, bad = false) {
-  message = { text, bad };
-  draw();
+// A success fades on its own. A failure stays until the next action, so it cannot be
+// missed by looking away.
+function currentMessage() {
+  if (message && message.until && Date.now() > message.until) message = null;
+  return message;
 }
 
 async function act(fn, done) {
+  message = null;
   try {
     await fn();
-    if (done) message = { text: done, bad: false };
+    if (done) message = { text: done, bad: false, until: Date.now() + SUCCESS_SHOWN_MS };
   } catch (err) {
     message = { text: err.message, bad: true };
   }
-  await refresh();
+  await refresh(true);
 }
 
 function usage(s) {
-  if (s.kind === 'past') return s.outsidePm2 ? 'Running outside pm2' : s.cannotStart || (s.guessed ? 'Command guessed from package.json' : 'Last command on record');
+  if (s.kind === 'past') {
+    if (s.outsidePm2) return 'Port in use outside pm2, may be this service';
+    return s.cannotStart || (s.guessed ? 'Command guessed from package.json, may not work' : 'Last command on record');
+  }
+  if (s.name === data.self) return 'This page';
   if (s.failed) return 'Crashed';
+  if (s.changing) return 'Changing state…';
   if (!s.running) return 'Stopped';
-  if (s.noPort) return 'Running, no port, never auto-stopped';
+  if (s.noPort) return 'Running with no port, so it never auto-stops';
   if (s.heldUntil) return `Held for ${shortDuration(Math.round((s.heldUntil * 1000 - Date.now()) / 60000))} more`;
   if (s.limit.mode === 'keep') return `Used ${shortDuration(s.idleMin)} ago`;
   const left = s.limit.minutes - s.idleMin;
-  return left > 0 ? `Used ${shortDuration(s.idleMin)} ago, stops in ${shortDuration(left)}` : `Unused for ${shortDuration(s.idleMin)}, stopping soon`;
+  return left > 0
+    ? `Used ${shortDuration(s.idleMin)} ago, stops within ${shortDuration(left + REAP_EVERY_MIN)}`
+    : `Unused for ${shortDuration(s.idleMin)}, stops within ${REAP_EVERY_MIN}m`;
 }
 
 function limitControl(s) {
   if (s.kind !== 'pm2') return null;
   if (s.name === data.self) return h('span', { class: 'hub-dim' }, 'Never stops');
+  if (s.noPort) return h('span', { class: 'hub-dim' }, 'No limit without a port');
   if (customFor === s.name) {
     return h('input', {
       class: 'hub-minutes', type: 'number', min: 1, max: 10080, placeholder: 'minutes', 'aria-label': `Idle limit for ${s.name}, in minutes`,
@@ -104,6 +120,7 @@ function limitControl(s) {
   ];
   const select = h('select', {
     class: 'hub-limit', 'aria-label': `Idle limit for ${s.name}`,
+    onfocus: () => { menuFocusedAt = Date.now(); },
     onchange: (e) => {
       const v = e.target.value;
       if (v === 'custom') { customFor = s.name; draw(true); document.querySelector('.hub-minutes')?.focus(); return; }
@@ -117,15 +134,16 @@ function limitControl(s) {
 }
 
 function actions(s) {
-  if (s.name === data.self) return null;
+  if (s.name === data.self || s.changing) return null;
   const go = (label, primary) => h('a', { class: `hub-btn${primary ? ' hub-primary' : ''}`, href: `/go/${encodeURIComponent(s.name)}`, target: '_blank', rel: 'noopener' }, label);
   if (s.kind === 'past') {
     if (s.outsidePm2) return go('Open', false);
-    return s.cmd ? go('Start and open', true) : null;
+    if (!s.cmd) return null;
+    return s.guessed ? go('Try to start', false) : go('Start and open', true);
   }
   if (!s.running) return go('Start and open', true);
   return [
-    s.port && !s.noPort ? go('Open', true) : null,
+    s.listening ? go('Open', true) : null,
     h('button', { class: 'hub-btn', type: 'button', onclick: () => act(() => post('/api/stop', { name: s.name }), `${s.name} stopped`) }, 'Stop'),
   ];
 }
@@ -166,35 +184,41 @@ function section(title, services, emptyText) {
   ];
 }
 
+// Redrawing would pull a half-typed number or an open menu out from under the
+// person. A menu only holds the list still for a moment, because a focused one with
+// no change would otherwise freeze every status until the next click elsewhere.
+function shouldWait(active) {
+  if (!active || !main.contains(active)) return false;
+  if (active.matches('.hub-minutes')) return true;
+  return active.matches('select') && Date.now() - menuFocusedAt < MENU_HOLD_MS;
+}
+
 function draw(force = false) {
-  // Redrawing would pull an open menu or a half-typed number out from under the person.
   const active = document.activeElement;
-  if (!force && !message && active && main.contains(active) && active.matches('select, .hub-minutes')) return;
+  if (!force && shouldWait(active)) return;
 
   const q = query.trim().toLowerCase();
   const all = (data?.services || []).filter((s) => !q || `${s.name} ${s.note} ${s.port ?? ''} ${s.cwd ?? ''}`.toLowerCase().includes(q));
   const managed = all.filter((s) => s.kind === 'pm2');
   const past = all.filter((s) => s.kind === 'past');
-  const running = managed.filter((s) => s.running).concat(past.filter((s) => s.outsidePm2));
-  const ready = managed.filter((s) => !s.running);
+  const running = managed.filter((s) => s.running || s.changing).concat(past.filter((s) => s.outsidePm2));
+  const ready = managed.filter((s) => !s.running && !s.changing);
   const startable = past.filter((s) => !s.outsidePm2 && s.cmd);
   const stuck = past.filter((s) => !s.outsidePm2 && !s.cmd);
 
   const search = document.querySelector('.hub-search') || h('input', {
     class: 'hub-search', type: 'search', placeholder: 'Find a service', 'aria-label': 'Find a service',
-    oninput: (e) => { query = e.target.value; draw(); },
+    oninput: (e) => { query = e.target.value; draw(true); },
   });
 
   const parts = [h('div', { class: 'hub-top' }, search,
-    h('p', { class: 'hub-lead' }, `Services stop on their own after ${duration(data.defaultLimitMin)} unused, unless you choose otherwise here.`))];
+    h('p', { class: 'hub-lead' }, `A service with a port stops after ${duration(data.defaultLimitMin)} unused, unless you set its limit here.`))];
 
-  if (data.tabReportAgeMin === null || data.tabReportAgeMin > 15) {
+  if (data.tabReportAgeMin === null || data.tabReportAgeMin > TAB_REPORT_STALE_MIN) {
     parts.push(h('p', { class: 'kit-note hub-warn' }, 'Your open tabs are not being counted as use, because the bfb extension has not reported lately. Reload it, or a short limit can stop a page you are reading.'));
   }
-  if (message) {
-    parts.push(h('p', { class: `kit-note ${message.bad ? 'hub-bad' : 'hub-good'}`, role: 'status' }, message.text));
-    message = null;
-  }
+  const shown = currentMessage();
+  if (shown) parts.push(h('p', { class: `kit-note ${shown.bad ? 'hub-bad' : 'hub-good'}`, role: 'status' }, shown.text));
 
   parts.push(...section('Running', running, q ? 'Nothing running matches.' : 'Nothing is running.'));
   parts.push(...section('Ready to start', ready, q ? 'Nothing here matches.' : 'Everything pm2 knows is running.'));
@@ -208,7 +232,7 @@ function draw(force = false) {
   },
     h('summary', {}, 'Older services ', h('span', { class: 'hub-count' }, String(startable.length + stuck.length))),
     showPast ? [
-      h('p', { class: 'kit-dim' }, 'Servers the port ledger remembers. Starting one runs the command shown, under pm2, so it auto-stops too.'),
+      h('p', { class: 'kit-dim' }, 'Servers the port ledger remembers. Starting one runs the command shown, under pm2, and stays listed there. It auto-stops once it opens a port.'),
       startable.length ? olderTable(startable) : h('p', { class: 'kit-dim' }, 'None of these can be started.'),
       stuck.length ? h('details', {
         class: 'hub-stuck', open: showStuck,
@@ -222,15 +246,23 @@ function draw(force = false) {
   window.dispatchEvent(new Event('scroll'));
 }
 
-async function refresh() {
+async function refresh(force = false) {
   try {
     const res = await fetch('/api/services');
     const answer = await res.json();
     if (!res.ok) throw new Error(answer.error);
     data = answer;
-    draw();
+    draw(force);
   } catch (err) {
-    main.replaceChildren(h('p', { class: 'kit-note hub-bad', role: 'status' }, `The hub could not read your services: ${err.message || 'no answer'}. Trying again.`));
+    const text = `The hub could not read your services: ${err.message || 'no answer'}. Trying again.`;
+    // Keep what is on screen if there is anything; one failed read should not cost
+    // the person their place or a half-typed number.
+    if (data) {
+      message = { text, bad: true, until: Date.now() + POLL_MS * 2 };
+      draw();
+    } else {
+      main.replaceChildren(h('p', { class: 'kit-note hub-bad', role: 'status' }, text));
+    }
   }
 }
 
@@ -239,6 +271,10 @@ async function goTo(name) {
   main.replaceChildren(h('p', { class: 'hub-go', role: 'status' }, `Starting ${name}…`));
   try {
     const answer = await post('/api/up', { name });
+    if (answer.url && answer.note) {
+      main.replaceChildren(h('p', { class: 'kit-note hub-warn', role: 'status' }, answer.note), h('p', {}, h('a', { href: answer.url }, `Open port ${new URL(answer.url).port} anyway`)));
+      return;
+    }
     if (answer.url) { location.replace(answer.url); return; }
     throw new Error(answer.error || `${name} started, but it has no page to open`);
   } catch (err) {
