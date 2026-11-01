@@ -8,15 +8,15 @@ const main = document.querySelector('.kit-page');
 const POLL_MS = 5000;
 const LIMITS = [5, 15, 30, 60, 120, 240, 480, 720, 1440];
 const TAB_REPORT_STALE_MIN = 10;
-const REAP_EVERY_MIN = 5;
 const TOAST_MS = 8000;
 const LOW_METER = 0.2;
+const MAX_MINUTES = 10080;
+const COMMON_REASON = 'No start command on record';
 
 let data = null;
 let query = '';
 let pastOpen = false;
 let stuckOpen = false;
-let readFailed = false;
 const busy = new Map();
 const rows = new Map();
 
@@ -61,20 +61,28 @@ async function post(path, body) {
 
 // ---- messages ----
 
-const toast = h('div', { class: 'hub-toast', role: 'status', hidden: true });
+const toast = h('div', { class: 'hub-toast', hidden: true });
+// Screen readers announce a change inside a region that already exists, so these two
+// stay in the page and only their text changes.
+const liveStatus = h('div', { class: 'hub-sr', role: 'status' });
+const liveAlert = h('div', { class: 'hub-sr', role: 'alert' });
 let toastTimer = null;
+let toastIsReadFailure = false;
 
 function hideToast() {
   clearTimeout(toastTimer);
   toast.hidden = true;
+  toastIsReadFailure = false;
 }
 
 // A success fades on its own. A failure stays until dismissed, so looking away
 // cannot lose it.
 function say(text, { bad = false, action = null } = {}) {
   clearTimeout(toastTimer);
+  toastIsReadFailure = false;
   toast.className = `hub-toast${bad ? ' bad' : ''}`;
-  toast.setAttribute('role', bad ? 'alert' : 'status');
+  setText(bad ? liveAlert : liveStatus, text);
+  setText(bad ? liveStatus : liveAlert, '');
   toast.replaceChildren(...[h('span', {}, text),
     action && h('button', { type: 'button', onclick: () => { hideToast(); action.run(); } }, action.label),
     bad && h('button', { type: 'button', onclick: hideToast }, 'Dismiss')].filter(Boolean));
@@ -101,7 +109,9 @@ function statusText(s) {
   if (busy.has(s.name)) return busy.get(s.name);
   if (s.kind === 'past') {
     if (s.outsidePm2) return 'Port in use outside pm2, may be this service';
-    return s.cannotStart || (s.guessed ? 'Command guessed from package.json, may not work' : 'Last command on record');
+    if (s.guessed) return 'Command guessed from package.json, may not work';
+    // The common reason is said once, above the list.
+    return s.cannotStart === COMMON_REASON ? '' : s.cannotStart || '';
   }
   if (s.name === data.self) return 'This page, always on';
   if (s.failed) return 'Crashed';
@@ -113,18 +123,18 @@ function statusText(s) {
   if (s.heldUntil) return `Held for ${shortDuration(Math.round((s.heldUntil * 1000 - Date.now()) / 60000))} more`;
   if (s.limit.mode === 'keep') return `Used ${shortDuration(s.idleMin)} ago`;
   const left = s.limit.minutes - s.idleMin;
-  return left > 0 ? `Stops within ${shortDuration(left + REAP_EVERY_MIN)} if unused` : `Stops within ${REAP_EVERY_MIN}m`;
+  return left > 0 ? `Stops in about ${shortDuration(left)}` : 'Stopping soon';
 }
 
 /** The share of the idle limit still left, or null when this service has no countdown. */
 function timeLeft(s) {
-  if (s.kind !== 'pm2' || !s.running || s.noPort || s.heldUntil || s.limit.mode === 'keep') return null;
+  if (s.kind !== 'pm2' || !s.running || s.noPort || s.booting || s.heldUntil || s.limit.mode === 'keep') return null;
   return Math.max(0, Math.min(1, 1 - s.idleMin / s.limit.minutes));
 }
 
 function limitText(s) {
   if (s.limit.mode === 'keep') return 'Never stops';
-  if (s.limit.mode === 'idle') return `${duration(s.limit.minutes)} idle`;
+  if (s.limit.mode === 'idle') return `Stops after ${duration(s.limit.minutes)}`;
   return `Default, ${duration(s.limit.minutes)}`;
 }
 
@@ -150,9 +160,9 @@ function createRow(name) {
     port: h('span', { class: 'hub-port' }),
     status: h('div', { class: 'hub-status' }),
     meterFill: h('i', {}),
-    limit: h('button', { class: 'hub-limit', type: 'button', 'aria-haspopup': 'menu', 'aria-expanded': 'false', hidden: true }),
+    limit: h('button', { class: 'hub-limit', type: 'button', 'aria-haspopup': 'dialog', 'aria-expanded': 'false', hidden: true }),
     go: h('a', { class: 'hub-go', target: '_blank', rel: 'noopener', hidden: true }),
-    stop: h('button', { class: 'hub-stop', type: 'button', hidden: true }, 'Stop'),
+    stop: h('button', { class: 'hub-stop', type: 'button', 'aria-label': `Stop ${name}`, hidden: true }, 'Stop'),
   };
   parts.meter = h('div', { class: 'hub-meter', 'aria-hidden': 'true', hidden: true }, parts.meterFill);
   parts.el = h('li', { class: 'hub-row', 'data-service': name },
@@ -176,12 +186,18 @@ function updateRow(p, s) {
   const isBusy = busy.has(s.name);
   const label = openLabel(s);
   p.el.setAttribute('aria-busy', String(isBusy));
-  p.dot.className = `hub-dot${s.failed ? ' bad' : s.running ? ' on' : s.changing ? ' changing' : ''}`;
+  p.el.toggleAttribute('data-guessed', Boolean(s.guessed));
+  const inBetween = s.changing || s.booting || s.outsidePm2;
+  p.dot.className = `hub-dot${s.failed ? ' bad' : inBetween ? ' changing' : s.running ? ' on' : ''}`;
   if (label && !isBusy) p.name.setAttribute('href', p.href);
   else p.name.removeAttribute('href');
 
-  setText(p.note, s.note || '');
-  p.note.hidden = !s.note;
+  // A row that cannot start still says where it lived, and a crash says where to look.
+  const where = s.kind === 'past' && !s.cmd && s.cwd ? `In ${s.cwd}` : '';
+  const logs = s.failed ? `See: pm2 logs ${s.name}` : '';
+  const noteText = [s.note, where, logs].filter(Boolean).join('. ');
+  setText(p.note, noteText);
+  p.note.hidden = !noteText;
   setText(p.cmd, s.kind === 'past' && s.cmd ? s.cmd : '');
   p.cmd.hidden = !(s.kind === 'past' && s.cmd);
   if (s.cwd) p.cmd.title = `In ${s.cwd}`;
@@ -206,6 +222,7 @@ function updateRow(p, s) {
   p.go.hidden = !label || isBusy;
   if (label) {
     p.go.setAttribute('href', p.href);
+    p.go.setAttribute('aria-label', `${label} ${s.name}`);
     setText(p.go, label);
   }
   p.stop.hidden = !(s.kind === 'pm2' && s.running && s.name !== data.self && !s.changing);
@@ -240,7 +257,7 @@ function fillList(list, services) {
 
 // ---- the idle limit menu ----
 
-const menu = h('div', { class: 'hub-menu', popover: 'auto', role: 'menu', 'aria-label': 'Idle limit' });
+const menu = h('div', { class: 'hub-menu', popover: 'auto', role: 'dialog', 'aria-label': 'Idle limit' });
 let menuAnchor = null;
 
 function setLimit(name, body, text) {
@@ -254,24 +271,31 @@ function openMenu(name, anchor) {
   const s = data.services.find((x) => x.name === name);
   const minutes = new Set(LIMITS);
   if (s.limit.mode === 'idle') minutes.add(s.limit.minutes);
-  const item = (label, checked, run) => h('button', { type: 'button', role: 'menuitemradio', 'aria-checked': String(checked), onclick: run }, label);
+  const item = (label, current, run) => h('button', { type: 'button', tabindex: '-1', 'aria-pressed': String(current), onclick: run }, label);
   const defaultMin = s.limit.mode === 'default' ? s.limit.minutes : data.defaultLimitMin;
+  const problem = h('p', { class: 'hub-menu-problem', role: 'alert', hidden: true }, `Enter a whole number from 1 to ${MAX_MINUTES}.`);
 
   const custom = h('input', {
-    class: 'hub-minutes', type: 'number', min: 1, max: 10080, placeholder: 'Other, in minutes', 'aria-label': `Idle limit for ${name}, in minutes`,
+    class: 'hub-minutes', type: 'number', min: 1, max: MAX_MINUTES, placeholder: 'Other, in minutes', 'aria-label': `Idle limit for ${name}, in minutes`,
     onkeydown: (e) => {
       if (e.key !== 'Enter') return;
+      // The same key press would otherwise reach the button focus returns to, and reopen this.
+      e.preventDefault();
       const value = Number(e.target.value);
-      setLimit(name, { mode: 'idle', minutes: value }, `${name} now stops after ${duration(value)} unused`);
+      const good = Number.isInteger(value) && value >= 1 && value <= MAX_MINUTES;
+      problem.hidden = good;
+      e.target.toggleAttribute('aria-invalid', !good);
+      if (good) setLimit(name, { mode: 'idle', minutes: value }, `${name} now stops after ${duration(value)} unused`);
     },
   });
 
+  menu.setAttribute('aria-label', `Idle limit for ${name}`);
   menu.replaceChildren(
     item(`Default, ${duration(defaultMin)}`, s.limit.mode === 'default', () => setLimit(name, { mode: 'default' }, `${name} is back on the default limit`)),
     ...[...minutes].sort((a, b) => a - b).map((m) => item(duration(m), s.limit.mode === 'idle' && s.limit.minutes === m,
       () => setLimit(name, { mode: 'idle', minutes: m }, `${name} now stops after ${duration(m)} unused`))),
-    item('Never stop', s.limit.mode === 'keep', () => setLimit(name, { mode: 'keep' }, `${name} will not auto-stop`)),
-    custom);
+    item('Never stops', s.limit.mode === 'keep', () => setLimit(name, { mode: 'keep' }, `${name} will not auto-stop`)),
+    custom, problem);
 
   menuAnchor = anchor;
   anchor.setAttribute('aria-expanded', 'true');
@@ -281,8 +305,11 @@ function openMenu(name, anchor) {
   const below = box.bottom + 4 + size.height <= innerHeight;
   menu.style.top = `${below ? box.bottom + 4 : Math.max(8, box.top - 4 - size.height)}px`;
   menu.style.left = `${Math.max(8, Math.min(box.left, innerWidth - size.width - 8))}px`;
-  (menu.querySelector('[aria-checked="true"]') || menu.querySelector('button')).focus();
+  (menu.querySelector('[aria-pressed="true"]') || menu.querySelector('button')).focus();
 }
+
+// An open menu would otherwise stay put while its row scrolls away.
+window.addEventListener('scroll', () => { if (menuAnchor) menu.hidePopover(); }, { passive: true });
 
 menu.addEventListener('toggle', (e) => {
   if (e.newState === 'closed' && menuAnchor) {
@@ -293,11 +320,18 @@ menu.addEventListener('toggle', (e) => {
 });
 
 menu.addEventListener('keydown', (e) => {
-  if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
-  e.preventDefault();
+  if (e.key === 'Tab') { e.preventDefault(); menu.hidePopover(); return; }
+  const typing = e.target.matches('input');
   const items = [...menu.querySelectorAll('button, input')];
   const at = items.indexOf(document.activeElement);
-  items[(at + (e.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length].focus();
+  let to = null;
+  if (e.key === 'ArrowDown' || (e.key === 'j' && !typing)) to = (at + 1) % items.length;
+  if (e.key === 'ArrowUp' || (e.key === 'k' && !typing)) to = (at - 1 + items.length) % items.length;
+  if (e.key === 'Home' && !typing) to = 0;
+  if (e.key === 'End' && !typing) to = items.length - 1;
+  if (to === null) return;
+  e.preventDefault();
+  items[to].focus();
 });
 
 // ---- the page ----
@@ -306,18 +340,36 @@ const search = h('input', {
   class: 'hub-search', type: 'search', placeholder: 'Find a service', 'aria-label': 'Find a service', autocomplete: 'off', spellcheck: 'false',
   oninput: (e) => { query = e.target.value; update(); },
   onkeydown: (e) => {
-    if (e.key === 'Escape') { search.value = ''; query = ''; update(); }
-    if (e.key === 'Enter') main.querySelector('.hub-go:not([hidden])')?.click();
+    if (e.key === 'Escape') { search.value = ''; query = ''; search.blur(); update(); }
+    if (e.key === 'Enter') openTopMatch();
     if (e.key === 'ArrowDown') { e.preventDefault(); moveFocus(1); }
   },
 });
-const notice = h('p', { class: 'hub-notice', hidden: true });
+const notice = h('p', { class: 'kit-note kit-warn hub-notice', role: 'status', hidden: true });
+
+// What Enter in the search box will do is marked on the row before it is pressed. A
+// guessed command is never run from here; Enter moves to it, so the click is deliberate.
+function topMatch() {
+  if (!query.trim()) return null;
+  const row = main.querySelector('.hub-row');
+  return row && !row.querySelector('.hub-go').hidden ? row : null;
+}
+
+function openTopMatch() {
+  const row = topMatch();
+  if (!row) return;
+  const go = row.querySelector('.hub-go');
+  if (row.hasAttribute('data-guessed')) go.focus();
+  else go.click();
+}
 
 function group(title) {
   const count = h('span', { class: 'hub-count' });
   const list = h('ul', { class: 'hub-list' });
   const empty = h('p', { class: 'hub-empty', hidden: true });
-  const el = h('section', { class: 'hub-group', 'aria-label': title }, h('h2', { class: 'hub-head' }, title, count), list, empty);
+  const titleId = `group-${title.toLowerCase()}`;
+  const el = h('section', { class: 'hub-group', 'aria-labelledby': titleId },
+    h('h2', { class: 'hub-head' }, h('span', { id: titleId }, title), count), list, empty);
   return { el, count, list, empty };
 }
 
@@ -328,11 +380,12 @@ const startableList = h('ul', { class: 'hub-list' });
 const stuckList = h('ul', { class: 'hub-list' });
 const stuckCount = h('span', { class: 'hub-count' });
 const pastCount = h('span', { class: 'hub-count' });
-const stuckFold = h('details', { class: 'hub-fold' }, h('summary', {}, 'No way to start', stuckCount), stuckList);
+const stuckWhy = h('p', { class: 'hub-why' });
+const stuckFold = h('details', { class: 'hub-fold' }, h('summary', {}, h('h3', { class: 'hub-head' }, 'No way to start', stuckCount)), stuckWhy, stuckList);
+const pastWhy = h('p', { class: 'hub-why' }, 'Servers the port ledger remembers. Starting one runs the command shown, under pm2, and it stays listed above. It auto-stops once it opens a port.');
 const pastFold = h('details', { class: 'hub-fold' },
-  h('summary', {}, 'Older services', pastCount),
-  h('p', { class: 'hub-why' }, 'Servers the port ledger remembers. Starting one runs the command shown, under pm2, and it stays listed above. It auto-stops once it opens a port.'),
-  startableList, stuckFold);
+  h('summary', {}, h('h2', { class: 'hub-head' }, 'Older services', pastCount)),
+  pastWhy, startableList, stuckFold);
 const noMatch = h('p', { class: 'hub-empty', hidden: true });
 
 pastFold.addEventListener('toggle', () => { if (!query.trim()) { pastOpen = pastFold.open; update(); } });
@@ -345,7 +398,7 @@ function update() {
   const managed = all.filter((s) => s.kind === 'pm2');
   const past = all.filter((s) => s.kind === 'past');
   const running = managed.filter((s) => s.running || s.changing).concat(past.filter((s) => s.outsidePm2));
-  const stopped = managed.filter((s) => !s.running && !s.changing);
+  const stopped = managed.filter((s) => !s.running && !s.changing).sort((a, b) => Number(b.failed) - Number(a.failed));
   const startable = past.filter((s) => !s.outsidePm2 && s.cmd);
   const stuck = past.filter((s) => !s.outsidePm2 && !s.cmd);
 
@@ -364,12 +417,20 @@ function update() {
   const showStuck = stuckOpen || Boolean(q);
   pastFold.open = showPast;
   stuckFold.open = showStuck;
-  setText(pastCount, String(startable.length + stuck.length));
+  setText(pastCount, `${startable.length} can start, ${stuck.length} cannot`);
   setText(stuckCount, String(stuck.length));
   fillList(startableList, showPast ? startable : []);
   fillList(stuckList, showPast && showStuck ? stuck : []);
   stuckFold.hidden = !stuck.length;
+  pastWhy.hidden = !startable.length;
   pastFold.parentElement.hidden = Boolean(q) && !startable.length && !stuck.length;
+
+  const tally = {};
+  for (const s of stuck) tally[s.cannotStart] = (tally[s.cannotStart] || 0) + 1;
+  setText(stuckWhy, Object.entries(tally).sort((a, b) => b[1] - a[1]).map(([why, n]) => `${why}: ${n}`).join('. '));
+
+  main.querySelectorAll('.is-next').forEach((row) => row.classList.remove('is-next'));
+  topMatch()?.classList.add('is-next');
 
   noMatch.hidden = !q || all.length > 0;
   setText(noMatch, `No service matches “${query.trim()}”. Search covers names, notes, ports and folders.`);
@@ -377,11 +438,8 @@ function update() {
   // A machine-wide fact, said once, and only while it can cost something.
   const stale = data.tabReportAgeMin === null || data.tabReportAgeMin > TAB_REPORT_STALE_MIN;
   const atRisk = data.services.some((s) => timeLeft(s) !== null);
-  let line = '';
-  if (readFailed) line = 'The hub could not read your services just now. Showing the last known state, and trying again.';
-  else if (stale && atRisk) line = 'Reload the bfb extension. Until then, open tabs do not count as use, so a service can stop while you read it.';
-  setText(notice, line);
-  notice.hidden = !line;
+  setText(notice, stale && atRisk ? 'Reload the bfb extension. Until then, open tabs do not count as use, so a service can stop while you read it.' : '');
+  notice.hidden = !(stale && atRisk);
 }
 
 async function refresh() {
@@ -390,13 +448,20 @@ async function refresh() {
     const answer = await res.json();
     if (!res.ok) throw new Error(answer.error);
     data = answer;
-    readFailed = false;
+    if (toastIsReadFailure) hideToast();
     showPage();
     update();
   } catch (err) {
-    readFailed = true;
-    if (data) update();
-    else main.replaceChildren(h('p', { role: 'alert' }, `The hub could not read your services: ${err.message || 'no answer'}. Trying again.`));
+    const text = `The hub could not read your services: ${err.message || 'no answer'}. Trying again.`;
+    if (!data) {
+      main.replaceChildren(h('p', { role: 'alert' }, text));
+      return;
+    }
+    // In the message corner, so a passing failure moves nothing under the pointer.
+    if (!toastIsReadFailure) {
+      say('The hub could not read your services just now. Showing the last known state, and trying again.', { bad: true });
+      toastIsReadFailure = true;
+    }
   }
 }
 
@@ -408,12 +473,13 @@ function showPage() {
   main.replaceChildren(
     h('label', { class: 'hub-find' }, search, h('kbd', { 'aria-hidden': 'true' }, '/')),
     notice, noMatch, runningGroup.el, stoppedGroup.el,
-    h('section', { class: 'hub-group', 'aria-label': 'Older services' }, pastFold),
-    h('p', { class: 'hub-keys' }, 'Keys: ', h('kbd', {}, '/'), ' find, ', h('kbd', {}, 'j'), ' and ', h('kbd', {}, 'k'), ' move, ', h('kbd', {}, 'Enter'), ' opens'));
+    h('section', { class: 'hub-group' }, pastFold),
+    h('p', { class: 'hub-keys' }, 'Keys: ', h('kbd', {}, '/'), ' find, ', h('kbd', {}, 'Esc'), ' clear, ', h('kbd', {}, 'j'), ' ', h('kbd', {}, 'k'), ' move, ',
+      h('kbd', {}, 'Enter'), ' opens, ', h('kbd', {}, 'l'), ' limit, ', h('kbd', {}, 'x'), ' stop'));
 }
 
 function moveFocus(step) {
-  const links = [...main.querySelectorAll('a.hub-name[href]')].filter((a) => a.offsetParent !== null);
+  const links = [...main.querySelectorAll('a.hub-name[href], .hub-fold > summary')].filter((a) => a.offsetParent !== null);
   if (!links.length) return;
   const at = links.indexOf(document.activeElement);
   if (at === -1) { links[step > 0 ? 0 : links.length - 1].focus(); return; }
@@ -429,6 +495,9 @@ document.addEventListener('keydown', (e) => {
   if (e.key === '/') { e.preventDefault(); search.focus(); search.select(); }
   if (e.key === 'j' || e.key === 'ArrowDown') { e.preventDefault(); moveFocus(1); }
   if (e.key === 'k' || e.key === 'ArrowUp') { e.preventDefault(); moveFocus(-1); }
+  const row = e.target.closest('.hub-row');
+  if (row && e.key === 'l' && !row.querySelector('.hub-limit').hidden) row.querySelector('.hub-limit').click();
+  if (row && e.key === 'x' && !row.querySelector('.hub-stop').hidden) row.querySelector('.hub-stop').click();
 });
 
 // ---- text size, one setting for the whole page ----
@@ -448,7 +517,7 @@ const sizes = h('div', { class: 'hub-sizes', role: 'group', 'aria-label': 'Text 
     h('button', { type: 'button', 'data-size': size, 'aria-label': label, 'aria-pressed': 'false', onclick: () => setSize(size) }, size.toUpperCase().slice(0, 1))));
 document.querySelector('.kit-theme').before(sizes);
 setSize(readSize());
-document.body.append(toast, menu);
+document.body.append(toast, menu, liveStatus, liveAlert);
 
 // ---- starting up ----
 
