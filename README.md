@@ -9,6 +9,8 @@ http://localhost:5042/api → REST API (see /api for docs)
 
 No external runtime dependencies. Node built-ins + the local `pm2` CLI.
 
+For starting, opening and tuning services day to day, use the much lighter service hub in [`hub/`](hub/) at `http://localhost:3999`. It runs on its own and needs nothing from the dashboard below.
+
 ---
 
 ## Architecture

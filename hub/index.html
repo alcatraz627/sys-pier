@@ -1,0 +1,711 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Services</title>
+<style>
+/*
+ * colors.css: a drop-in colour system for a generated HTML page.
+ *
+ * Copy this into a <style> block (or link it) and the page has a full palette,
+ * a dark and a light mode, and the five variables the dark/light toggle in
+ * conventions/html-output.md expects. Dark is the default, per that rule.
+ *
+ * HOW IT IS PUT TOGETHER: two layers, and the split is the whole point:
+ *
+ *   Layer 0   the ramps. Raw colour, every family 50 -> 950. Nothing outside
+ *             this file's Layer 1 should ever name a ramp step directly.
+ *   Layer 1   the slots. --bg, --text, --brand, --ok-soft and friends. This is
+ *             what your markup uses. Both modes set the same slot names to
+ *             different ramp steps, which is why the toggle is one class flip
+ *             and not a second stylesheet.
+ *
+ * TO REBRAND: change the hue numbers in Layer 0 and stop. Every slot, both
+ * modes, and every element follow, because nothing downstream hardcodes a
+ * colour. That is the property worth protecting: the moment a page writes
+ * `color: #4a9` somewhere, dark mode has a hole in it.
+ *
+ * The hues here are deliberate placeholders (brand 250, accent 190), not any
+ * real product's identity. Swap them.
+ *
+ * Ramps are OKLCH: oklch(lightness chroma hue). Lightness falls evenly down the
+ * ramp; chroma peaks around 500 and eases off both ends, which is what keeps a
+ * 50 from looking muddy and a 950 from looking neon.
+ */
+
+/* ── Layer 0: ramps (never name these in your markup) ─────────────────── */
+:root {
+  /* neutral: chrome, text, borders, surfaces */
+  --p-neutral-50: oklch(0.985 0.002 255);
+  --p-neutral-100: oklch(0.96 0.004 255);
+  --p-neutral-200: oklch(0.92 0.006 255);
+  --p-neutral-300: oklch(0.86 0.01 255);
+  --p-neutral-400: oklch(0.7 0.018 255);
+  --p-neutral-500: oklch(0.55 0.025 255);
+  --p-neutral-600: oklch(0.45 0.028 255);
+  --p-neutral-700: oklch(0.37 0.03 255);
+  --p-neutral-800: oklch(0.29 0.028 255);
+  --p-neutral-900: oklch(0.22 0.022 255);
+  --p-neutral-950: oklch(0.15 0.016 255);
+
+  /* brand: the one colour a reader should associate with the page */
+  --p-brand-50: oklch(0.97 0.02 250);
+  --p-brand-100: oklch(0.94 0.04 250);
+  --p-brand-200: oklch(0.88 0.07 250);
+  --p-brand-300: oklch(0.81 0.1 250);
+  --p-brand-400: oklch(0.72 0.13 250);
+  --p-brand-500: oklch(0.63 0.15 250);
+  --p-brand-600: oklch(0.55 0.145 250);
+  --p-brand-700: oklch(0.47 0.125 251);
+  --p-brand-800: oklch(0.4 0.1 251);
+  --p-brand-900: oklch(0.33 0.078 252);
+  --p-brand-950: oklch(0.25 0.05 252);
+
+  /* accent: a second voice, for highlights the brand shouldn't claim */
+  --p-accent-50: oklch(0.97 0.02 190);
+  --p-accent-100: oklch(0.94 0.042 190);
+  --p-accent-200: oklch(0.89 0.068 190);
+  --p-accent-300: oklch(0.83 0.092 190);
+  --p-accent-400: oklch(0.75 0.108 190);
+  --p-accent-500: oklch(0.66 0.115 191);
+  --p-accent-600: oklch(0.57 0.108 192);
+  --p-accent-700: oklch(0.48 0.092 193);
+  --p-accent-800: oklch(0.4 0.076 193);
+  --p-accent-900: oklch(0.33 0.058 194);
+  --p-accent-950: oklch(0.25 0.04 194);
+
+  /* success */
+  --p-success-50: oklch(0.97 0.02 150);
+  --p-success-100: oklch(0.94 0.045 150);
+  --p-success-200: oklch(0.88 0.072 150);
+  --p-success-300: oklch(0.81 0.1 150);
+  --p-success-400: oklch(0.72 0.118 150);
+  --p-success-500: oklch(0.63 0.13 150);
+  --p-success-600: oklch(0.55 0.12 150);
+  --p-success-700: oklch(0.47 0.104 150);
+  --p-success-800: oklch(0.4 0.086 150);
+  --p-success-900: oklch(0.33 0.068 150);
+  --p-success-950: oklch(0.25 0.045 150);
+
+  /* warning */
+  --p-warning-50: oklch(0.98 0.025 85);
+  --p-warning-100: oklch(0.95 0.055 85);
+  --p-warning-200: oklch(0.91 0.09 83);
+  --p-warning-300: oklch(0.86 0.125 81);
+  --p-warning-400: oklch(0.81 0.148 78);
+  --p-warning-500: oklch(0.76 0.155 75);
+  --p-warning-600: oklch(0.67 0.142 70);
+  --p-warning-700: oklch(0.58 0.125 65);
+  --p-warning-800: oklch(0.49 0.105 60);
+  --p-warning-900: oklch(0.41 0.085 55);
+  --p-warning-950: oklch(0.32 0.06 50);
+
+  /* danger */
+  --p-danger-50: oklch(0.97 0.018 25);
+  --p-danger-100: oklch(0.93 0.04 25);
+  --p-danger-200: oklch(0.87 0.08 25);
+  --p-danger-300: oklch(0.8 0.12 25);
+  --p-danger-400: oklch(0.73 0.165 26);
+  --p-danger-500: oklch(0.65 0.2 27);
+  --p-danger-600: oklch(0.58 0.195 27);
+  --p-danger-700: oklch(0.5 0.175 27);
+  --p-danger-800: oklch(0.43 0.15 27);
+  --p-danger-900: oklch(0.36 0.12 27);
+  --p-danger-950: oklch(0.28 0.085 27);
+
+  /* info */
+  --p-info-50: oklch(0.97 0.018 230);
+  --p-info-100: oklch(0.94 0.04 230);
+  --p-info-200: oklch(0.88 0.065 230);
+  --p-info-300: oklch(0.81 0.09 230);
+  --p-info-400: oklch(0.72 0.11 230);
+  --p-info-500: oklch(0.63 0.125 230);
+  --p-info-600: oklch(0.55 0.115 230);
+  --p-info-700: oklch(0.47 0.1 230);
+  --p-info-800: oklch(0.4 0.082 230);
+  --p-info-900: oklch(0.33 0.065 230);
+  --p-info-950: oklch(0.25 0.045 230);
+}
+
+/* ── Layer 1: slots, dark (the default) ───────────────────────────────── */
+:root {
+  /* The five the toggle in html-output.md depends on. Keep these names. */
+  --bg: var(--p-neutral-950);
+  --surface: var(--p-neutral-900);
+  --text: var(--p-neutral-100);
+  --dim: var(--p-neutral-400);
+  --border: var(--p-neutral-800);
+
+  /* Room to build with: a raised surface for cards on cards, and two quieter
+     text tiers, so hierarchy comes from the palette instead of from opacity. */
+  --surface-2: var(--p-neutral-800);
+  --text-2: var(--p-neutral-300);
+  --text-3: var(--p-neutral-500);
+
+  --brand: var(--p-brand-400);
+  --brand-content: var(--p-neutral-950);
+  --brand-hover: var(--p-brand-300);
+  --accent: var(--p-accent-400);
+  --accent-content: var(--p-neutral-950);
+
+  /* Status comes in pairs: -soft backs a pill or a row tint, -line is the ink
+     or rule that sits on it. Using them together is what keeps a status
+     readable in both modes without a per-mode override at the callsite. */
+  --ok-soft: oklch(0.28 0.05 150);
+  --ok-line: var(--p-success-300);
+  --warn-soft: oklch(0.3 0.06 75);
+  --warn-line: var(--p-warning-300);
+  --err-soft: oklch(0.29 0.06 27);
+  --err-line: var(--p-danger-300);
+  --info-soft: oklch(0.28 0.05 230);
+  --info-line: var(--p-info-300);
+
+  --shadow-sm: 0 2px 5px -1px oklch(0 0 0 / 0.45), 0 1px 2px -1px oklch(0 0 0 / 0.4);
+  --shadow-md: 0 8px 18px -4px oklch(0 0 0 / 0.55), 0 3px 6px -3px oklch(0 0 0 / 0.4);
+  --shadow-lg: 0 22px 44px -10px oklch(0 0 0 / 0.65), 0 8px 16px -8px oklch(0 0 0 / 0.45);
+
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 1rem;
+
+  color-scheme: dark;
+}
+
+/* ── Layer 1: slots, light ────────────────────────────────────────────── */
+/* `body.light` is the toggle's contract (html-output.md). The [data-theme]
+   selector is here too so this file also works on pages that theme from the
+   root element; drop whichever one your page doesn't use. */
+body.light,
+:root[data-theme="light"] {
+  --bg: var(--p-neutral-50);
+  --surface: oklch(1 0 0);
+  --text: var(--p-neutral-900);
+  --dim: var(--p-neutral-500);
+  --border: var(--p-neutral-200);
+
+  --surface-2: var(--p-neutral-100);
+  --text-2: var(--p-neutral-700);
+  --text-3: var(--p-neutral-500);
+
+  /* A step deeper than dark's brand: filled controls read light text here, and
+     the airy 400 that works on a near-black page cannot hold white. */
+  --brand: var(--p-brand-600);
+  --brand-content: oklch(1 0 0);
+  --brand-hover: var(--p-brand-700);
+  --accent: var(--p-accent-600);
+  --accent-content: oklch(1 0 0);
+
+  --ok-soft: var(--p-success-100);
+  --ok-line: var(--p-success-700);
+  /* 900, not 700: the mid warning ink drops under 4.5:1 on its own soft tint at
+     pill sizes. Warning is the one family where the obvious pairing fails. */
+  --warn-soft: var(--p-warning-100);
+  --warn-line: var(--p-warning-900);
+  --err-soft: var(--p-danger-100);
+  --err-line: var(--p-danger-700);
+  --info-soft: var(--p-info-100);
+  --info-line: var(--p-info-700);
+
+  --shadow-sm: 0 2px 4px -1px oklch(0.3 0.02 255 / 0.12), 0 1px 2px -1px oklch(0.3 0.02 255 / 0.1);
+  --shadow-md: 0 6px 14px -3px oklch(0.3 0.02 255 / 0.18), 0 3px 6px -3px oklch(0.3 0.02 255 / 0.12);
+  --shadow-lg: 0 18px 36px -8px oklch(0.3 0.02 255 / 0.26), 0 6px 12px -6px oklch(0.3 0.02 255 / 0.14);
+
+  color-scheme: light;
+}
+
+/* A floor to build on, so a page that just includes this file already reads
+   correctly in both modes instead of inheriting the browser's white. */
+body {
+  background: var(--bg);
+  color: var(--text);
+}
+
+/* The shared look for every HTML page an agent builds: reports, previews, decision
+   pages, shared Artifacts. Colours come from conventions/html-assets/colors.css, which
+   pagekit.py inlines above this file. Nothing here names a colour directly, so a theme
+   change is one edit in colors.css. Guide: conventions/pages.md */
+
+:root {
+  --kit-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --kit-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --kit-width: 1100px;
+  --kit-measure: 74ch;
+}
+* { box-sizing: border-box; }
+html { scroll-padding-top: 96px; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.6 var(--kit-sans); }
+
+/* The bar stays on top. Table headers stop just under it. */
+.kit-bar { position: sticky; top: 0; z-index: 5; background: var(--surface); border-bottom: 1px solid var(--border); }
+.kit-bar-inner { max-width: var(--kit-width); margin: 0 auto; padding: 10px 16px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.kit-title { font: 600 17px/1.2 var(--kit-sans); margin: 0; margin-right: auto; }
+.kit-theme { font: 500 12.5px var(--kit-sans); color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 999px; padding: 5px 12px; cursor: pointer; }
+.kit-theme:focus-visible, .kit-tab:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+
+.kit-tabs { display: flex; flex-wrap: wrap; gap: 5px; max-width: var(--kit-width); margin: 0 auto; padding: 0 16px 10px; }
+.kit-tab { font: 500 12.5px var(--kit-sans); color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 999px; padding: 5px 12px; cursor: pointer; }
+.kit-tab[aria-selected="true"] { color: var(--brand-content); background: var(--brand); border-color: var(--brand); }
+
+.kit-page { max-width: var(--kit-width); margin: 0 auto; padding: 28px 16px 80px; }
+.kit-page h1 { font: 600 30px/1.15 var(--kit-sans); margin: 0 0 14px; text-wrap: balance; }
+.kit-page h2 { font: 600 20px/1.25 var(--kit-sans); margin: 40px 0 12px; text-wrap: balance; }
+.kit-page h3 { font: 600 16px/1.3 var(--kit-sans); margin: 28px 0 8px; }
+.kit-page h4 { font: 600 14px/1.3 var(--kit-sans); margin: 20px 0 6px; }
+.kit-page p, .kit-page li { max-width: var(--kit-measure); }
+.kit-page p { margin: 0 0 12px; }
+.kit-page ul, .kit-page ol { padding-left: 22px; margin: 0 0 14px; }
+.kit-page li { margin: 5px 0; }
+.kit-page a { color: var(--brand); }
+.kit-page code { font: 13px var(--kit-mono); background: var(--surface-2); padding: 1px 5px; border-radius: var(--radius-sm); }
+.kit-page pre { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 14px; overflow-x: auto; font: 13px/1.45 var(--kit-mono); }
+.kit-page pre code { background: none; padding: 0; }
+.kit-dim { color: var(--dim); }
+
+/* Tables. pagekit.size_columns sets each column's width from what it holds. */
+.kit-table-wrap { overflow-x: auto; }
+.kit-page table { border-collapse: collapse; width: 100%; margin: 14px 0 20px; font-size: 14px; table-layout: fixed; }
+.kit-page table.kit-wide { min-width: 1400px; }
+.kit-page th, .kit-page td { overflow-wrap: anywhere; vertical-align: top; text-align: left; }
+.kit-page thead { position: relative; z-index: 2; }
+.kit-page thead th { font: 600 11px var(--kit-sans); letter-spacing: .06em; text-transform: uppercase; color: var(--dim); padding: 8px 10px; border-bottom: 2px solid var(--border); background: var(--bg); }
+.kit-page thead.kit-stuck th { background: var(--surface); box-shadow: 0 1px 0 var(--border), var(--shadow-sm); }
+.kit-page td { padding: 9px 10px; border-bottom: 1px solid var(--border); }
+.kit-page td:first-child { font-weight: 500; }
+.kit-page tr:hover td { background: var(--surface-2); }
+.kit-page td p { margin: 0 0 4px; max-width: none; }
+.kit-page td ul { margin: 0; padding-left: 16px; }
+.kit-page td li { margin: 2px 0; max-width: none; }
+
+/* Labelled lists that sit side by side, for things a reader compares. */
+.kit-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin: 12px 0 22px; align-items: start; }
+.kit-col { background: var(--surface); border: 1px solid var(--border); border-top: 3px solid var(--border); border-radius: var(--radius-md); padding: 10px 14px 8px; }
+.kit-col.kit-good { border-top-color: var(--ok-line); }
+.kit-col.kit-warn { border-top-color: var(--warn-line); }
+.kit-col.kit-bad { border-top-color: var(--err-line); }
+.kit-col > h4 { font: 600 11px var(--kit-sans); letter-spacing: .06em; text-transform: uppercase; color: var(--dim); margin: 0 0 6px; }
+.kit-col ul { margin: 0; padding-left: 18px; }
+.kit-col li { max-width: none; font-size: 14px; margin: 4px 0; }
+
+/* A card of key and value pairs, for what a page is and who it is for. */
+.kit-card { display: grid; grid-template-columns: 120px 1fr; gap: 6px 16px; padding: 14px 18px; margin: 0 0 24px; background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--brand); border-radius: var(--radius-md); font-size: 14px; }
+.kit-card > .k { font: 600 11px var(--kit-sans); letter-spacing: .06em; text-transform: uppercase; color: var(--dim); padding-top: 3px; }
+
+/* The one sentence a reader must not miss. */
+.kit-key { margin: 16px 0; padding: 12px 18px; border-left: 3px solid var(--brand); background: var(--surface-2); border-radius: 0 var(--radius-md) var(--radius-md) 0; }
+.kit-key p { margin: 0; max-width: none; }
+
+/* Status notes. Use the word as well as the colour. */
+.kit-note { margin: 14px 0; padding: 10px 14px; border: 1px solid var(--border); border-left-width: 3px; border-radius: var(--radius-md); background: var(--surface); }
+.kit-note.kit-good { border-left-color: var(--ok-line); background: var(--ok-soft); }
+.kit-note.kit-warn { border-left-color: var(--warn-line); background: var(--warn-soft); }
+.kit-note.kit-bad { border-left-color: var(--err-line); background: var(--err-soft); }
+.kit-note.kit-info { border-left-color: var(--info-line); background: var(--info-soft); }
+.kit-note p { margin: 0; max-width: none; }
+
+.kit-chip { display: inline-block; font: 500 11.5px var(--kit-mono); padding: 0 6px; border-radius: var(--radius-sm); line-height: 18px; background: var(--surface-2); border: 1px solid var(--border); }
+
+[hidden] { display: none !important; }
+@media (max-width: 640px) { .kit-page h1 { font-size: 24px; } .kit-card { grid-template-columns: 1fr; } }
+@media print { .kit-bar, .kit-theme { display: none; } body { background: #fff; color: #000; } }
+
+/* The service list. Colours come only from the shared kit's variables. */
+:root { --hub-control: 30px; }
+
+.hub-top { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 16px; margin-bottom: 8px; }
+.hub-lead { margin: 0; color: var(--dim); font-size: 14px; }
+.hub-search { width: 240px; }
+
+.hub-search, .hub-limit, .hub-minutes {
+  height: var(--hub-control); padding: 0 10px; font: 13px var(--kit-sans); color: var(--text);
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+.hub-limit { width: 100%; cursor: pointer; }
+.hub-minutes { width: 100%; }
+.hub-search:focus-visible, .hub-limit:focus-visible, .hub-minutes:focus-visible, .hub-btn:focus-visible {
+  outline: 2px solid var(--brand); outline-offset: 1px;
+}
+
+.kit-page h2 { display: flex; align-items: center; gap: 8px; margin: 28px 0 4px; font-size: 16px; }
+.kit-page h3 { font-size: 14px; }
+.hub-count { font: 500 12px var(--kit-sans); color: var(--dim); }
+
+.kit-page table.hub-table { margin: 0 0 8px; }
+.hub-table th:nth-child(1) { width: auto; }
+.hub-table th:nth-child(2) { width: 72px; }
+.hub-table th:nth-child(3) { width: 240px; }
+.hub-table th:nth-child(4) { width: 170px; }
+.hub-table th:nth-child(5) { width: 190px; }
+.kit-page .hub-table td { vertical-align: middle; font-weight: 400; }
+
+.hub-name { display: flex; align-items: center; gap: 8px; font-weight: 600; overflow-wrap: anywhere; }
+.hub-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; border: 1px solid var(--dim); }
+.hub-dot.on { background: var(--ok-line); border-color: var(--ok-line); }
+.hub-dot.bad { background: var(--err-line); border-color: var(--err-line); }
+.hub-note { margin: 2px 0 0 16px; color: var(--dim); font-size: 13px; }
+.kit-page code.hub-cmd { display: block; margin: 4px 0 0 16px; padding: 0; background: none; color: var(--dim); font-size: 12px; overflow-wrap: anywhere; }
+.hub-port { font: 13px var(--kit-mono); color: var(--dim); }
+.hub-use { font-size: 13px; color: var(--dim); }
+.hub-dim { font-size: 13px; color: var(--dim); }
+
+.hub-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 6px; }
+.kit-page a.hub-btn, .hub-btn {
+  display: inline-flex; align-items: center; height: var(--hub-control); padding: 0 12px;
+  font: 500 13px var(--kit-sans); white-space: nowrap; text-decoration: none; cursor: pointer;
+  color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+.kit-page a.hub-btn:hover, .hub-btn:hover { background: var(--surface-2); }
+.kit-page a.hub-primary { color: var(--brand-content); background: var(--brand); border-color: var(--brand); }
+.kit-page a.hub-primary:hover { background: var(--brand-hover); border-color: var(--brand-hover); }
+
+.hub-past { margin-top: 28px; }
+.hub-past summary { cursor: pointer; font: 600 16px var(--kit-sans); }
+.hub-stuck { margin-top: 20px; }
+.hub-stuck summary { font-size: 14px; }
+.hub-older th:nth-child(4) { width: 190px; }
+.hub-past > p { margin: 8px 0; }
+
+.hub-good { border-left-color: var(--ok-line); }
+.hub-bad { border-left-color: var(--err-line); }
+.hub-warn { border-left-color: var(--warn-line); }
+.hub-go { font-size: 16px; }
+
+@media (max-width: 860px) {
+  .hub-table th:nth-child(2), .hub-table td:nth-child(2) { display: none; }
+  .hub-table th:nth-child(3) { width: 130px; }
+  .hub-table th:nth-child(4) { width: 170px; }
+  .hub-table th:nth-child(5) { width: 150px; }
+  .hub-older th:nth-child(4) { width: 150px; }
+}
+
+</style>
+</head>
+<body>
+<header class="kit-bar"><div class="kit-bar-inner"><h1 class="kit-title">Services</h1><button type="button" class="kit-theme" data-kit-theme>Light</button></div></header>
+<main class="kit-page">
+
+</main>
+<script>
+// Behaviour every page shares: the theme switch, tables that scroll inside
+// their own box, table headers that follow the reader, and plain tabs.
+// Inlined into a page by pagekit.py. Guide: conventions/pages.md
+(function () {
+  const root = document.documentElement;
+
+  // Theme. Dark is the default; the choice is remembered when the browser allows it.
+  function readTheme() { try { return localStorage.getItem('kit-theme'); } catch (e) { return null; } }
+  function applyTheme(t) {
+    root.dataset.theme = t;
+    document.body.classList.toggle('light', t === 'light');
+    document.querySelectorAll('[data-kit-theme]').forEach(b => { b.textContent = t === 'light' ? 'Dark' : 'Light'; b.setAttribute('aria-label', 'Switch to ' + (t === 'light' ? 'dark' : 'light') + ' theme'); });
+  }
+  applyTheme(readTheme() || root.dataset.theme || 'dark');
+  document.addEventListener('click', e => {
+    const b = e.target.closest('[data-kit-theme]'); if (!b) return;
+    const next = root.dataset.theme === 'light' ? 'dark' : 'light';
+    applyTheme(next);
+    try { localStorage.setItem('kit-theme', next); } catch (err) {}
+  });
+
+  // Every table scrolls sideways inside its own box, never the whole page.
+  document.querySelectorAll('.kit-page table').forEach(t => {
+    if (t.parentElement.classList.contains('kit-table-wrap')) return;
+    const w = document.createElement('div'); w.className = 'kit-table-wrap';
+    t.parentNode.insertBefore(w, t); w.appendChild(t);
+  });
+
+  // Table headers follow the reader. CSS sticky cannot do this, because a
+  // header cannot stick past the scroll box its table sits in.
+  const bar = document.querySelector('.kit-bar');
+  let queued = false;
+  function stick() {
+    queued = false;
+    const top = bar ? bar.getBoundingClientRect().bottom : 0;
+    document.querySelectorAll('.kit-page table').forEach(t => {
+      const h = t.tHead; if (!h || t.offsetParent === null) return;
+      const box = t.getBoundingClientRect();
+      const dy = (box.top < top && box.bottom - h.offsetHeight - 40 > top) ? Math.round(top - box.top) : 0;
+      h.style.transform = dy ? 'translateY(' + dy + 'px)' : '';
+      h.classList.toggle('kit-stuck', dy > 0);
+    });
+  }
+  function queue() { if (!queued) { queued = true; requestAnimationFrame(stick); } }
+  window.addEventListener('scroll', queue, { passive: true });
+  window.addEventListener('resize', queue);
+
+  // Tabs. A button with data-kit-tab="x" shows the element with data-kit-panel="x".
+  const tabs = Array.from(document.querySelectorAll('[data-kit-tab]'));
+  function show(name) {
+    tabs.forEach(t => t.setAttribute('aria-selected', String(t.dataset.kitTab === name)));
+    document.querySelectorAll('[data-kit-panel]').forEach(p => { p.hidden = p.dataset.kitPanel !== name; });
+    window.scrollTo(0, 0); queue();
+  }
+  tabs.forEach(t => t.addEventListener('click', () => { show(t.dataset.kitTab); try { history.replaceState(null, '', '#' + t.dataset.kitTab); } catch (e) {} }));
+  if (tabs.length) {
+    const wanted = (location.hash || '').slice(1);
+    show(tabs.some(t => t.dataset.kitTab === wanted) ? wanted : tabs[0].dataset.kitTab);
+  }
+})();
+
+// The hub page: draws the service list from /api/services, and sends a person's
+// clicks back as start, stop and limit requests. Opening /go/<name> in a tab starts
+// that service and then moves the tab to it, so a slow start never hits a pop-up
+// blocker, and the address works as a bookmark.
+
+const main = document.querySelector('.kit-page');
+const POLL_MS = 5000;
+const LIMITS = [5, 15, 30, 60, 120, 240, 480, 720, 1440];
+
+let data = null;
+let query = '';
+let pastOpen = false;
+let stuckOpen = false;
+let customFor = null;
+let message = null;
+
+function h(tag, attrs = {}, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else if (k === 'value') el.value = v;
+    else el.setAttribute(k, v === true ? '' : v);
+  }
+  for (const kid of kids.flat()) {
+    if (kid !== null && kid !== undefined && kid !== false) el.append(kid);
+  }
+  return el;
+}
+
+function duration(min) {
+  if (min < 60) return `${min} min`;
+  const hours = Math.floor(min / 60);
+  const rest = min % 60;
+  const head = `${hours} hour${hours === 1 ? '' : 's'}`;
+  return rest ? `${head} ${rest} min` : head;
+}
+
+function shortDuration(min) {
+  if (min < 1) return 'moments';
+  if (min < 60) return `${min}m`;
+  if (min < 48 * 60) return `${Math.floor(min / 60)}h ${min % 60}m`.replace(/ 0m$/, '');
+  return `${Math.floor(min / 1440)}d`;
+}
+
+async function post(path, body) {
+  const res = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const answer = await res.json().catch(() => ({ ok: false, error: 'The hub did not answer' }));
+  if (!res.ok || answer.ok === false) throw new Error(answer.error || 'That did not work');
+  return answer;
+}
+
+function say(text, bad = false) {
+  message = { text, bad };
+  draw();
+}
+
+async function act(fn, done) {
+  try {
+    await fn();
+    if (done) message = { text: done, bad: false };
+  } catch (err) {
+    message = { text: err.message, bad: true };
+  }
+  await refresh();
+}
+
+function usage(s) {
+  if (s.kind === 'past') return s.outsidePm2 ? 'Running outside pm2' : s.cannotStart || (s.guessed ? 'Command guessed from package.json' : 'Last command on record');
+  if (s.failed) return 'Crashed';
+  if (!s.running) return 'Stopped';
+  if (s.noPort) return 'Running, no port, never auto-stopped';
+  if (s.heldUntil) return `Held for ${shortDuration(Math.round((s.heldUntil * 1000 - Date.now()) / 60000))} more`;
+  if (s.limit.mode === 'keep') return `Used ${shortDuration(s.idleMin)} ago`;
+  const left = s.limit.minutes - s.idleMin;
+  return left > 0 ? `Used ${shortDuration(s.idleMin)} ago, stops in ${shortDuration(left)}` : `Unused for ${shortDuration(s.idleMin)}, stopping soon`;
+}
+
+function limitControl(s) {
+  if (s.kind !== 'pm2') return null;
+  if (s.name === data.self) return h('span', { class: 'hub-dim' }, 'Never stops');
+  if (customFor === s.name) {
+    return h('input', {
+      class: 'hub-minutes', type: 'number', min: 1, max: 10080, placeholder: 'minutes', 'aria-label': `Idle limit for ${s.name}, in minutes`,
+      onkeydown: (e) => {
+        if (e.key === 'Escape') { customFor = null; draw(true); }
+        if (e.key === 'Enter') {
+          customFor = null;
+          const minutes = Number(e.target.value);
+          act(() => post('/api/limit', { name: s.name, mode: 'idle', minutes }), `${s.name} now stops after ${duration(minutes)} unused`);
+        }
+      },
+      onblur: () => { if (customFor === s.name) { customFor = null; draw(true); } },
+    });
+  }
+  const current = s.limit.mode === 'idle' ? String(s.limit.minutes) : s.limit.mode;
+  const minutes = new Set(LIMITS);
+  if (s.limit.mode === 'idle') minutes.add(s.limit.minutes);
+  const options = [
+    h('option', { value: 'default' }, `Default (${duration(s.limit.mode === 'default' ? s.limit.minutes : data.defaultLimitMin)})`),
+    ...[...minutes].sort((a, b) => a - b).map((m) => h('option', { value: String(m) }, duration(m))),
+    h('option', { value: 'keep' }, 'Never stop'),
+    h('option', { value: 'custom' }, 'Custom…'),
+  ];
+  const select = h('select', {
+    class: 'hub-limit', 'aria-label': `Idle limit for ${s.name}`,
+    onchange: (e) => {
+      const v = e.target.value;
+      if (v === 'custom') { customFor = s.name; draw(true); document.querySelector('.hub-minutes')?.focus(); return; }
+      if (v === 'default') act(() => post('/api/limit', { name: s.name, mode: 'default' }), `${s.name} is back on the default limit`);
+      else if (v === 'keep') act(() => post('/api/limit', { name: s.name, mode: 'keep' }), `${s.name} will not auto-stop`);
+      else act(() => post('/api/limit', { name: s.name, mode: 'idle', minutes: Number(v) }), `${s.name} now stops after ${duration(Number(v))} unused`);
+    },
+  }, options);
+  select.value = current;
+  return select;
+}
+
+function actions(s) {
+  if (s.name === data.self) return null;
+  const go = (label, primary) => h('a', { class: `hub-btn${primary ? ' hub-primary' : ''}`, href: `/go/${encodeURIComponent(s.name)}`, target: '_blank', rel: 'noopener' }, label);
+  if (s.kind === 'past') {
+    if (s.outsidePm2) return go('Open', false);
+    return s.cmd ? go('Start and open', true) : null;
+  }
+  if (!s.running) return go('Start and open', true);
+  return [
+    s.port && !s.noPort ? go('Open', true) : null,
+    h('button', { class: 'hub-btn', type: 'button', onclick: () => act(() => post('/api/stop', { name: s.name }), `${s.name} stopped`) }, 'Stop'),
+  ];
+}
+
+function row(s) {
+  return h('tr', { 'data-service': s.name },
+    h('td', {},
+      h('div', { class: 'hub-name' }, h('span', { class: `hub-dot ${s.failed ? 'bad' : s.running ? 'on' : ''}`, 'aria-hidden': 'true' }), s.name),
+      s.note ? h('div', { class: 'hub-note' }, s.note) : null,
+      s.kind === 'past' && s.cmd ? h('code', { class: 'hub-cmd', title: s.cwd ? `In ${s.cwd}` : null }, s.cmd) : null),
+    h('td', { class: 'hub-port' }, s.port ? `:${s.port}` : ''),
+    h('td', { class: 'hub-use' }, usage(s)),
+    h('td', {}, limitControl(s)),
+    h('td', {}, h('div', { class: 'hub-actions' }, actions(s))));
+}
+
+function table(services) {
+  return h('div', { class: 'kit-table-wrap' }, h('table', { class: 'hub-table' },
+    h('thead', {}, h('tr', {}, ['Service', 'Port', 'Status', 'Idle limit', ''].map((t) => h('th', {}, t)))),
+    h('tbody', {}, services.map(row))));
+}
+
+// Older services have no idle limit until pm2 runs them, so their rows drop that column.
+function olderTable(services) {
+  return h('div', { class: 'kit-table-wrap' }, h('table', { class: 'hub-table hub-older' },
+    h('thead', {}, h('tr', {}, ['Service', 'Port', 'Status', ''].map((t) => h('th', {}, t)))),
+    h('tbody', {}, services.map((s) => {
+      const tr = row(s);
+      tr.children[3].remove();
+      return tr;
+    }))));
+}
+
+function section(title, services, emptyText) {
+  return [
+    h('h2', {}, title, ' ', h('span', { class: 'hub-count' }, String(services.length))),
+    services.length ? table(services) : h('p', { class: 'kit-dim' }, emptyText),
+  ];
+}
+
+function draw(force = false) {
+  // Redrawing would pull an open menu or a half-typed number out from under the person.
+  const active = document.activeElement;
+  if (!force && !message && active && main.contains(active) && active.matches('select, .hub-minutes')) return;
+
+  const q = query.trim().toLowerCase();
+  const all = (data?.services || []).filter((s) => !q || `${s.name} ${s.note} ${s.port ?? ''} ${s.cwd ?? ''}`.toLowerCase().includes(q));
+  const managed = all.filter((s) => s.kind === 'pm2');
+  const past = all.filter((s) => s.kind === 'past');
+  const running = managed.filter((s) => s.running).concat(past.filter((s) => s.outsidePm2));
+  const ready = managed.filter((s) => !s.running);
+  const startable = past.filter((s) => !s.outsidePm2 && s.cmd);
+  const stuck = past.filter((s) => !s.outsidePm2 && !s.cmd);
+
+  const search = document.querySelector('.hub-search') || h('input', {
+    class: 'hub-search', type: 'search', placeholder: 'Find a service', 'aria-label': 'Find a service',
+    oninput: (e) => { query = e.target.value; draw(); },
+  });
+
+  const parts = [h('div', { class: 'hub-top' }, search,
+    h('p', { class: 'hub-lead' }, `Services stop on their own after ${duration(data.defaultLimitMin)} unused, unless you choose otherwise here.`))];
+
+  if (data.tabReportAgeMin === null || data.tabReportAgeMin > 15) {
+    parts.push(h('p', { class: 'kit-note hub-warn' }, 'Your open tabs are not being counted as use, because the bfb extension has not reported lately. Reload it, or a short limit can stop a page you are reading.'));
+  }
+  if (message) {
+    parts.push(h('p', { class: `kit-note ${message.bad ? 'hub-bad' : 'hub-good'}`, role: 'status' }, message.text));
+    message = null;
+  }
+
+  parts.push(...section('Running', running, q ? 'Nothing running matches.' : 'Nothing is running.'));
+  parts.push(...section('Ready to start', ready, q ? 'Nothing here matches.' : 'Everything pm2 knows is running.'));
+
+  // Older rows run to the hundreds, so they are only built while their section is open.
+  const showPast = pastOpen || Boolean(q);
+  const showStuck = stuckOpen || Boolean(q);
+  parts.push(h('details', {
+    class: 'hub-past', open: showPast,
+    ontoggle: (e) => { if (e.target.open !== showPast) { pastOpen = e.target.open; draw(true); } },
+  },
+    h('summary', {}, 'Older services ', h('span', { class: 'hub-count' }, String(startable.length + stuck.length))),
+    showPast ? [
+      h('p', { class: 'kit-dim' }, 'Servers the port ledger remembers. Starting one runs the command shown, under pm2, so it auto-stops too.'),
+      startable.length ? olderTable(startable) : h('p', { class: 'kit-dim' }, 'None of these can be started.'),
+      stuck.length ? h('details', {
+        class: 'hub-stuck', open: showStuck,
+        ontoggle: (e) => { if (e.target.open !== showStuck) { stuckOpen = e.target.open; draw(true); } },
+      }, h('summary', {}, 'No way to start ', h('span', { class: 'hub-count' }, String(stuck.length))), showStuck ? olderTable(stuck) : null) : null,
+    ] : null));
+
+  main.replaceChildren(...parts);
+  if (search === active) search.focus();
+  // New tables need the kit to place their headers, and it only does that on a scroll.
+  window.dispatchEvent(new Event('scroll'));
+}
+
+async function refresh() {
+  try {
+    const res = await fetch('/api/services');
+    const answer = await res.json();
+    if (!res.ok) throw new Error(answer.error);
+    data = answer;
+    draw();
+  } catch (err) {
+    main.replaceChildren(h('p', { class: 'kit-note hub-bad', role: 'status' }, `The hub could not read your services: ${err.message || 'no answer'}. Trying again.`));
+  }
+}
+
+async function goTo(name) {
+  document.title = `Starting ${name}`;
+  main.replaceChildren(h('p', { class: 'hub-go', role: 'status' }, `Starting ${name}…`));
+  try {
+    const answer = await post('/api/up', { name });
+    if (answer.url) { location.replace(answer.url); return; }
+    throw new Error(answer.error || `${name} started, but it has no page to open`);
+  } catch (err) {
+    document.title = `${name} did not open`;
+    main.replaceChildren(h('p', { class: 'kit-note hub-bad', role: 'alert' }, err.message), h('p', {}, h('a', { href: '/' }, 'Back to all services')));
+  }
+}
+
+const going = /^\/go\/(.+)$/.exec(location.pathname);
+if (going) {
+  goTo(decodeURIComponent(going[1]));
+} else {
+  main.replaceChildren(h('p', { class: 'kit-dim', role: 'status' }, 'Reading your services…'));
+  refresh();
+  setInterval(() => { if (!document.hidden) refresh(); }, POLL_MS);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+}
+
+</script>
+</body>
+</html>
