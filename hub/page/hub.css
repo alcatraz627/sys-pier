@@ -157,6 +157,9 @@
   background: none; border: 0; cursor: pointer; text-decoration: underline; text-underline-offset: 3px;
 }
 
+.kit-page p.hub-keys { margin: calc(28px * var(--c)) 0 0; color: var(--dim); font-size: var(--fs-small); }
+.hub-keys kbd { font: var(--fs-code) var(--kit-mono); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0 5px; }
+
 /* While the first read is on its way */
 .hub-skeleton { height: 12px; border-radius: 6px; background: var(--surface-2); }
 .hub-go-page { font-size: var(--fs-head); }

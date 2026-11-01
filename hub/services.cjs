@@ -7,6 +7,7 @@ const path = require('node:path');
 // The reason the hub gives svc when you set a limit. svc requires one for "never
 // stop", but it says nothing about the service, so it is never shown as a note.
 const HUB_REASON = 'set from the service hub';
+const BOOT_MIN = 2;
 
 const text = (v) => (typeof v === 'string' ? v : '');
 
@@ -53,9 +54,11 @@ function portInCommand(cmd) {
   return m ? portNumber(m[1]) : null;
 }
 
-// A dev script that picks its own port, or hands off to one app in a workspace,
-// would ignore the claimed port or start something other than the named service.
-const SCRIPT_DECIDES_ITSELF = /--port|\s-p\s|\bPORT=|--filter|\bturbo\b|\bnx\b|\blerna\b|concurrently/;
+// A guess needs a dev script that is plainly one server which will take the claimed
+// port. Anything else (a wrapper script, a workspace filter, a script with its own
+// port) could ignore the port or start something other than the named service.
+const SCRIPT_RUNS_ONE_SERVER = /^(vite|next|nuxt|astro|remix|svelte-kit|webpack|parcel|rsbuild|react-scripts|node|nodemon|tsx|bun)(\s|$)/;
+const SCRIPT_PICKS_ITS_PORT = /--port|\s-p\s|\bPORT=/;
 
 /**
  * How to start a service pm2 no longer knows. Prefers the exact command recorded
@@ -69,7 +72,9 @@ function startPlan(entry, fs) {
   if (entry.cmd) return { cmd: entry.cmd, guessed: false };
   const script = fs.devScript(entry.cwd);
   if (!entry.port || !script) return { cmd: null, reason: 'No start command on record' };
-  if (SCRIPT_DECIDES_ITSELF.test(script)) return { cmd: null, reason: 'Its dev script picks its own port or app' };
+  if (!SCRIPT_RUNS_ONE_SERVER.test(script) || SCRIPT_PICKS_ITS_PORT.test(script)) {
+    return { cmd: null, reason: 'Its dev script may not use its claimed port' };
+  }
   return { cmd: `PORT=${entry.port} npm run dev -- --port ${entry.port}`, guessed: true };
 }
 
@@ -94,6 +99,8 @@ function pm2Service(row, ledgerEntry, policy, defaultLimitMin) {
     note: why || (ledgerEntry && ledgerEntry.note) || '',
     heldUntil: row.hold_until || null,
     noPort: row.verdict === 'no-port(skip)',
+    // Just started with no port yet: most likely still opening one, so not a worker.
+    booting: row.verdict === 'no-port(skip)' && (row.age_min ?? Infinity) < BOOT_MIN,
   };
 }
 

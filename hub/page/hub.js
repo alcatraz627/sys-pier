@@ -75,9 +75,9 @@ function say(text, { bad = false, action = null } = {}) {
   clearTimeout(toastTimer);
   toast.className = `hub-toast${bad ? ' bad' : ''}`;
   toast.setAttribute('role', bad ? 'alert' : 'status');
-  toast.replaceChildren(h('span', {}, text),
-    action ? h('button', { type: 'button', onclick: () => { hideToast(); action.run(); } }, action.label) : null,
-    bad ? h('button', { type: 'button', onclick: hideToast }, 'Dismiss') : null);
+  toast.replaceChildren(...[h('span', {}, text),
+    action && h('button', { type: 'button', onclick: () => { hideToast(); action.run(); } }, action.label),
+    bad && h('button', { type: 'button', onclick: hideToast }, 'Dismiss')].filter(Boolean));
   toast.hidden = false;
   if (!bad) toastTimer = setTimeout(hideToast, TOAST_MS);
 }
@@ -108,6 +108,7 @@ function statusText(s) {
   if (s.changing) return 'Changing state…';
   // Its section heading already says so, unless a search has mixed the sections.
   if (!s.running) return '';
+  if (s.booting) return 'Starting up…';
   if (s.noPort) return 'Running with no port, so it never auto-stops';
   if (s.heldUntil) return `Held for ${shortDuration(Math.round((s.heldUntil * 1000 - Date.now()) / 60000))} more`;
   if (s.limit.mode === 'keep') return `Used ${shortDuration(s.idleMin)} ago`;
@@ -356,7 +357,7 @@ function update() {
     setText(g.empty, emptyText);
   };
   fill(runningGroup, running, 'Nothing is running.');
-  fill(stoppedGroup, stopped, 'Everything pm2 knows is running.');
+  fill(stoppedGroup, stopped, running.length ? 'Everything pm2 knows is running.' : 'pm2 knows no services yet. Anything you add to pm2 appears here by itself.');
 
   // Older rows run to the hundreds, so they only exist while their section is open.
   const showPast = pastOpen || Boolean(q);
@@ -407,7 +408,8 @@ function showPage() {
   main.replaceChildren(
     h('label', { class: 'hub-find' }, search, h('kbd', { 'aria-hidden': 'true' }, '/')),
     notice, noMatch, runningGroup.el, stoppedGroup.el,
-    h('section', { class: 'hub-group', 'aria-label': 'Older services' }, pastFold));
+    h('section', { class: 'hub-group', 'aria-label': 'Older services' }, pastFold),
+    h('p', { class: 'hub-keys' }, 'Keys: ', h('kbd', {}, '/'), ' find, ', h('kbd', {}, 'j'), ' and ', h('kbd', {}, 'k'), ' move, ', h('kbd', {}, 'Enter'), ' opens'));
 }
 
 function moveFocus(step) {

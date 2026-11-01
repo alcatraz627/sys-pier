@@ -197,7 +197,7 @@ async function startNow(name) {
     cached = null;
     const now = (await status()).services.find((s) => s.name === name);
     if (now?.listening) return { ok: true, url: urlFor(now.port) };
-    if (found.running && !found.listening) return { ok: false, url: null, error: `${name} is running, but it has no page to open` };
+    if (now?.running && !now.listening && !now.booting) return { ok: false, url: null, error: `${name} is running, but it has no page to open` };
   }
   const { row, stopped, timedOut } = await waitForPort(name);
   if (stopped) throw new Refused(502, `${name} stopped right after starting. See: pm2 logs ${name}`);

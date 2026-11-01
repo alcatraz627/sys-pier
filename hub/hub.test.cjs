@@ -94,14 +94,36 @@ test('the hub\'s own limit reason is not shown as a note about the service', () 
   assert.equal(merge([pm2Row({ why: 'serves pages' })])[0].note, 'serves pages');
 });
 
-test('a dev script that picks its own port or app gets no guess', () => {
+test('a guess is only offered for a dev script that is plainly one server on the claimed port', () => {
   const entry = { cwd: '/x', port: 6200 };
-  for (const script of ['next dev --port=3003', 'pnpm --filter app dev', 'vite -p 80', 'PORT=1 node s.js', 'turbo run dev']) {
+  for (const script of ['next dev --port=3003', 'pnpm --filter app dev', 'vite -p 80', 'PORT=1 node s.js', 'turbo run dev', 'bash scripts/dev.sh', 'concurrently a b', 'viteish']) {
     const plan = startPlan(entry, withScript(script));
     assert.equal(plan.cmd, null, script);
-    assert.match(plan.reason, /picks its own/, script);
+    assert.match(plan.reason, /may not use/, script);
   }
-  assert.equal(startPlan(entry, withScript('vite')).guessed, true);
+  for (const script of ['vite', 'next dev', 'node server.js']) {
+    assert.equal(startPlan(entry, withScript(script)).guessed, true, script);
+  }
+});
+
+test('a port outside the real range, and text fields of the wrong type, are dropped', () => {
+  const ledger = foldLedger(event({ name: 'x', port: 70000, note: 5, cmd: {}, ts: 9 }));
+  const x = ledger.get('x');
+  assert.equal(x.port, null);
+  assert.equal(x.note, '');
+  assert.equal(x.cmd, '');
+  assert.equal(x.lastTs, '');
+});
+
+test('a stopped service is never listening, even with a stale port', () => {
+  assert.equal(merge([pm2Row({ status: 'stopped' })])[0].listening, false);
+});
+
+test('only a service that just started counts as booting', () => {
+  const noPort = { ports: [], known_ports: [], verdict: 'no-port(skip)' };
+  assert.equal(merge([pm2Row({ ...noPort, age_min: 0.5 })])[0].booting, true);
+  assert.equal(merge([pm2Row({ ...noPort, age_min: 30 })])[0].booting, false);
+  assert.equal(merge([pm2Row({ ...noPort })])[0].booting, false);
 });
 
 test('pinned ports are the owner\'s own apps and never appear', () => {
@@ -137,9 +159,11 @@ test('a damaged ledger line does not hide the rest', () => {
 
 // ---- the server, over HTTP ----
 
-const PORT = 39127;
-const TAKEN_PORT = 39132;
-const LATE_PORT = 39137;
+// Per-run ports, so a second run at the same time, or a crashed earlier one, cannot clash.
+const PORT = 40000 + (process.pid % 20000);
+const TAKEN_PORT = PORT + 1;
+const LATE_PORT = PORT + 2;
+process.on('exit', () => child?.kill());
 const blocker = net.createServer();
 const base = `http://127.0.0.1:${PORT}`;
 const origin = { Origin: base, 'Content-Type': 'application/json' };
@@ -164,6 +188,7 @@ before(async () => {
     pm2Row({ name: 'service-hub', ports: [PORT], known_ports: [PORT], idle_limit_min: null }),
     pm2Row({ name: 'web app', ports: [39133], known_ports: [39133] }),
     pm2Row({ name: 'no-port-app', ports: [], known_ports: [], verdict: 'no-port(skip)' }),
+    pm2Row({ name: 'booting-app', ports: [], known_ports: [], verdict: 'no-port(skip)', age_min: 0.2 }),
     pm2Row({ name: 'remembered-only', status: 'stopped', ports: [], known_ports: [39134] }),
     pm2Row({ name: 'launching-app', status: 'launching', ports: [], known_ports: [39135] }),
   ]);
@@ -307,6 +332,21 @@ test('a service running without a port says so at once, rather than waiting', as
   assert.equal(body.ok, false);
   assert.match(body.error, /no page to open/);
   assert.ok(Date.now() - started < 1400, 'answered before the start wait ran out');
+});
+
+test('a service still booting is waited for, not told it has no page', async () => {
+  const body = await (await post('/api/up', { name: 'booting-app' })).json();
+  assert.equal(body.ok, false);
+  assert.match(body.error, /nothing is listening yet/);
+  assert.doesNotMatch(body.error, /no page to open/);
+});
+
+test('a finished start is forgotten, so the next one really runs', async () => {
+  const count = () => calls().split('\n').filter((l) => l === 'svc.sh up online-app').length;
+  await post('/api/up', { name: 'online-app' });
+  const first = count();
+  await post('/api/up', { name: 'online-app' });
+  assert.equal(count(), first + 1);
 });
 
 test('a remembered port with nothing of its own listening gives no address', async () => {
